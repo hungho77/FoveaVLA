@@ -69,6 +69,12 @@ def location_classes_to_token_ids(classes: np.ndarray) -> np.ndarray:
     return (classes + LOCATION_TOKEN_START_ID).astype(np.int32)
 
 
+def letterbox_patch_rows(patch_size: int = 14) -> tuple[int, int]:
+    """Return the [start, stop) patch rows of a letterboxed 16:9 full view that contain image content."""
+    _, _, resized_height, _, pad_y = _letterbox_geometry()
+    return pad_y // patch_size, -(-(pad_y + resized_height) // patch_size)
+
+
 def _letterbox_geometry() -> tuple[float, int, int, int, int]:
     ratio = max(RAW_IMAGE_WIDTH / MODEL_IMAGE_SIZE, RAW_IMAGE_HEIGHT / MODEL_IMAGE_SIZE)
     resized_height = int(RAW_IMAGE_HEIGHT / ratio)
