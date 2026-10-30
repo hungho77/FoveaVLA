@@ -319,6 +319,13 @@ class TrainConfig:
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=RLDSDroidDataConfig)
 
+    # PyTorch trainer only (scripts/train_pytorch.py): initial weights in FoveaVLAPytorch / openpi PI0Pytorch layout
+    # (a directory with model.safetensors, e.g. openpi's pi05_base_pytorch), and the parameter precision. "bfloat16"
+    # stores bf16 weights as openpi's PyTorch trainer does; "float32" keeps fp32 weights and runs the forward under
+    # bf16 autocast, which is closer to the JAX trainer (fp32 params, bf16 compute) and uses more memory.
+    pytorch_weight_path: str | None = None
+    pytorch_training_precision: str = "bfloat16"
+
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
