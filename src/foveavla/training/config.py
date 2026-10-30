@@ -17,6 +17,7 @@ import foveavla.models.foveavla_config as foveavla_config
 import foveavla.models.future_bbox as future_bbox
 import foveavla.models.tokenizer as _tokenizer
 import foveavla.policies.droid_policy as droid_policy
+import foveavla.policies.so101_policy as so101_policy
 import foveavla.shared.download as _download
 import foveavla.shared.normalize as _normalize
 import foveavla.training.droid_rlds_dataset as droid_rlds_dataset
@@ -74,6 +75,9 @@ class DataConfig:
     rlds_shuffle_buffer_size: int = 250_000
     # List of datasets to sample from: name, version, weight, and optionally filter_dict_path
     datasets: Sequence[droid_rlds_dataset.RLDSDataset] = ()
+    # SO101 store from so101_port/build_store.py; when set, it replaces the DROID RLDS pipeline.
+    so101_store_dir: str | None = None
+    so101_train_episodes: tuple[int, ...] = ()
 
 
 class GroupFactory(Protocol):
@@ -245,6 +249,50 @@ class RLDSDroidDataConfig(DataConfigFactory):
 
 
 @dataclasses.dataclass(frozen=True)
+class SO101FovealDataConfig(DataConfigFactory):
+    """FoveaVLA-Single on an SO101 arm: one top RGB-D camera, five arm joints plus the gripper (absolute positions)."""
+
+    store_dir: str | None = None
+    train_episodes: tuple[int, ...] = ()
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        if self.store_dir is None:
+            raise ValueError("Set the SO101 store directory")
+        if model_config.future_bbox_count != 1 or model_config.image_keys != ("base_0_rgb", "left_wrist_0_rgb"):
+            raise ValueError("The SO101 store has one top camera: one full view, one foveal crop, one future box")
+        keys = [
+            "observation/exterior_image_1_left",
+            "observation/foveal_image",
+            "observation/joint_position",
+            "observation/gripper_position",
+            "actions",
+            "prompt",
+            "future_interaction_box",
+            "future_interaction_box_mask",
+        ]
+        keys += [f"observation/{f}_{s}" for s in ("full", "crop") for f in ("metric_depth", "pointmap_quality")]
+        data_transforms = _transforms.Group(
+            inputs=[
+                droid_policy.DroidInputs(),
+                _transforms.DeltaActions(_transforms.make_bool_mask(5, -1)),
+            ],
+            outputs=[
+                _transforms.AbsoluteActions(_transforms.make_bool_mask(5, -1)),
+                so101_policy.SO101Outputs(),
+            ],
+        )
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=_transforms.Group(inputs=[_transforms.RepackTransform({k: k for k in keys})]),
+            data_transforms=data_transforms,
+            model_transforms=ModelTransformFactory()(model_config),
+            so101_store_dir=self.store_dir,
+            so101_train_episodes=self.train_episodes,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class TrainConfig:
     # Name of the config. Must be unique. Will be used to reference this config.
     name: tyro.conf.Suppress[str]
@@ -270,6 +318,13 @@ class TrainConfig:
 
     # Determines the data to be trained on.
     data: DataConfigFactory = dataclasses.field(default_factory=RLDSDroidDataConfig)
+
+    # PyTorch trainer only (scripts/train_pytorch.py): initial weights in FoveaVLAPytorch / openpi PI0Pytorch layout
+    # (a directory with model.safetensors, e.g. openpi's pi05_base_pytorch), and the parameter precision. "bfloat16"
+    # stores bf16 weights as openpi's PyTorch trainer does; "float32" keeps fp32 weights and runs the forward under
+    # bf16 autocast, which is closer to the JAX trainer (fp32 params, bf16 compute) and uses more memory.
+    pytorch_weight_path: str | None = None
+    pytorch_training_precision: str = "bfloat16"
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -469,9 +524,51 @@ def _efficient(config: TrainConfig) -> TrainConfig:
     )
 
 
+
+_SO101_STORE = os.environ.get(
+    "FOVEAVLA_SO101_STORE", "/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_drawer_red_block_v30/foveavla_store"
+)
+# 57 episodes minus the held-out six (seeded: rng(0).choice of the valid ones) and episodes 5 and 24, whose gripper
+# never moves (constant state and action).
+SO101_HELDOUT_EPISODES = (2, 15, 17, 28, 34, 44)
+SO101_EXCLUDED_EPISODES = (5, 24)
+SO101_TRAIN_EPISODES = tuple(e for e in range(57) if e not in SO101_HELDOUT_EPISODES + SO101_EXCLUDED_EPISODES)
+
+# FoveaVLA-Single recipe on one H100: same model, loss weights, crop sampling and LR, with batch 32 and 20k steps
+# for the 50-episode SO101 set. Norm stats are computed for SO101 (scripts/compute_norm_stats.py), not DROID's.
+_so101_single_config = dataclasses.replace(
+    _single_config,
+    name="foveavla_so101_single",
+    data=SO101FovealDataConfig(
+        repo_id="so101_drawer",
+        store_dir=_SO101_STORE,
+        train_episodes=SO101_TRAIN_EPISODES,
+    ),
+    num_train_steps=20_000,
+    batch_size=32,
+    save_interval=2000,
+    keep_period=5000,
+    fsdp_devices=1,
+    policy_metadata=_single_config.policy_metadata
+    | {
+        "model_name": "FoveaVLA-Single-SO101",
+        "droid_exterior_views": ("top",),
+        "future_bbox_views": ("top",),
+        "metric_depth_reference": "so101_top_rgbd_camera",
+        "metric_depth_source": "so101_top_depth_sensor",
+        "requires_fast_foundation_stereo_pair": False,
+    },
+)
+
 _CONFIGS_DICT = {
     config.name: config
-    for config in (_single_config, _dual_config, _efficient(_single_config), _efficient(_dual_config))
+    for config in (
+        _single_config,
+        _dual_config,
+        _efficient(_single_config),
+        _efficient(_dual_config),
+        _so101_single_config,
+    )
 }
 CONFIG_NAMES = tuple(_CONFIGS_DICT)
 
