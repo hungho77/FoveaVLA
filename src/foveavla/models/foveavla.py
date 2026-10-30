@@ -23,6 +23,7 @@ METRIC_DEPTH_NEAR_M = 0.2
 METRIC_DEPTH_FAR_M = 3.0
 METRIC_DEPTH_QUALITY_MIN = 0.1
 METRIC_DEPTH_PATCH_MIN_VALID_FRACTION = 0.25
+PATCH_GRID_SIZE = foveavla_config.PATCH_GRID_SIZE
 _TURBO_POLYNOMIAL_COEFFICIENTS = (
     (0.13572138, 4.61539260, -42.66032258, 132.13108234, -152.94239396, 59.28637943),
     (0.09140261, 2.19418839, 4.84296658, -14.18503333, 4.27729857, 2.82956604),
@@ -221,6 +222,23 @@ def _metric_depth_to_siglip_image(depth_m, quality, *, patch_size: int = 14):
     return image, patch_valid
 
 
+def _select_patch_rows(patch_mask, rows):
+    """Keep patch rows [start, stop) of a flattened square patch-grid mask."""
+    start, stop = rows
+    grid = einops.rearrange(patch_mask, "b (h w) -> b h w", h=PATCH_GRID_SIZE)
+    return einops.rearrange(grid[:, start:stop], "b h w -> b (h w)")
+
+
+def _pool_masked_tokens(tokens, valid, rows: int, columns: int, pool: int):
+    """Average valid tokens over pool×pool patch windows; a window is valid if any of its patches is."""
+    weights = valid.astype(tokens.dtype)[..., None]
+    pattern = "b (h ph w pw) c -> b (h w) c"
+    sizes = {"h": rows // pool, "w": columns // pool, "ph": pool, "pw": pool}
+    total = einops.reduce(tokens * weights, pattern, "sum", **sizes)
+    count = einops.reduce(weights, pattern, "sum", **sizes)
+    return total / jnp.maximum(count, 1), count[..., 0] > 0
+
+
 class FoveaVLA(_model.BaseModel):
     def __init__(self, config: foveavla_config.FoveaVLAConfig, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
@@ -229,6 +247,8 @@ class FoveaVLA(_model.BaseModel):
         self.depth_view_dropout_prob = config.depth_view_dropout_prob
         self.future_bbox_count = config.future_bbox_count
         self.bbox_loss_weight = config.bbox_loss_weight
+        self.full_view_patch_rows = config.full_view_patch_rows
+        self.depth_token_pool = config.depth_token_pool
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
         llm = nnx_bridge.ToNNX(
@@ -256,6 +276,9 @@ class FoveaVLA(_model.BaseModel):
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
         self.deterministic = True
 
+    def _patch_rows(self, key: str) -> tuple[int, int] | None:
+        return self.full_view_patch_rows if key in foveavla_config.FULL_VIEW_IMAGE_KEYS else None
+
     def _validate_depth_inputs(self, obs: _model.Observation):
         expected = set(self.depth_image_keys)
         depth_keys = set() if obs.depthmaps is None else set(obs.depthmaps)
@@ -274,7 +297,7 @@ class FoveaVLA(_model.BaseModel):
         self._validate_depth_inputs(obs)
         tokens, input_mask, ar_mask = [], [], []
         for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False, token_rows=self._patch_rows(name))
             tokens.append(image_tokens)
             input_mask.append(einops.repeat(obs.image_masks[name], "b -> b s", s=image_tokens.shape[1]))
             ar_mask.append(jnp.zeros(image_tokens.shape[:2], dtype=jnp.bool_))
@@ -296,7 +319,15 @@ class FoveaVLA(_model.BaseModel):
             )
             patch_valid &= obs.image_masks[image_key][:, None]
             patch_valid &= view_keep[:, view_index, None]
-            depth_tokens, _ = self.PaliGemma.img(depth_image, train=False, token_mask=patch_valid)
+            rows = self._patch_rows(image_key)
+            if rows is not None:
+                patch_valid = _select_patch_rows(patch_valid, rows)
+            depth_tokens, _ = self.PaliGemma.img(depth_image, train=False, token_mask=patch_valid, token_rows=rows)
+            if self.depth_token_pool > 1:
+                grid_rows = PATCH_GRID_SIZE if rows is None else rows[1] - rows[0]
+                depth_tokens, patch_valid = _pool_masked_tokens(
+                    depth_tokens, patch_valid, grid_rows, PATCH_GRID_SIZE, self.depth_token_pool
+                )
             tokens.append(depth_tokens)
             input_mask.append(patch_valid)
             ar_mask.append(jnp.zeros(depth_tokens.shape[:2], dtype=jnp.bool_))

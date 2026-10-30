@@ -214,7 +214,8 @@ class _Module(nn.Module):
     dtype_mm: str = "float32"
 
     @nn.compact
-    def __call__(self, image, *, train=False, token_mask=None):
+    def __call__(self, image, *, train=False, token_mask=None, token_rows=None):
+        """Encode an image; `token_rows=(start, stop)` keeps only those patch rows after the position embedding."""
         out = {}
 
         # Kevin edit: do patch extraction and posemb in float32,
@@ -233,11 +234,16 @@ class _Module(nn.Module):
 
         n, h, w, c = x.shape
         x = jnp.reshape(x, [n, h * w, c])
-        if token_mask is not None and token_mask.shape != (n, h * w):
-            raise ValueError(f"Expected token mask shape {(n, h * w)}, got {token_mask.shape}")
 
         # Add posemb before adding extra token.
         x = out["with_posemb"] = x + get_posemb(self, self.posemb, (h, w), c, "pos_embedding", jnp.float32)
+        if token_rows is not None:
+            # Drop rows after the full-grid posemb so kept patches retain their pretrained positions.
+            start, stop = token_rows
+            x = jnp.reshape(jnp.reshape(x, [n, h, w, c])[:, start:stop], [n, (stop - start) * w, c])
+            h = stop - start
+        if token_mask is not None and token_mask.shape != (n, h * w):
+            raise ValueError(f"Expected token mask shape {(n, h * w)}, got {token_mask.shape}")
         if token_mask is not None:
             x = jnp.where(token_mask[..., None], x, 0)
 

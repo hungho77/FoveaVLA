@@ -13,7 +13,7 @@ from foveavla.training import config
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", choices=("foveavla_single", "foveavla_dual"), required=True)
+    parser.add_argument("--model", choices=config.CONFIG_NAMES, required=True)
     parser.add_argument("--checkpoint", type=Path, help="Defaults to checkpoints/<model>; override for trained weights")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--fast-foundation-repository", type=Path, default=Path(".runtime/Fast-FoundationStereo"))

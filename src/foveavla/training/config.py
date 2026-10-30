@@ -14,6 +14,7 @@ from typing_extensions import override
 import tyro
 import foveavla.models.model as _model
 import foveavla.models.foveavla_config as foveavla_config
+import foveavla.models.future_bbox as future_bbox
 import foveavla.models.tokenizer as _tokenizer
 import foveavla.policies.droid_policy as droid_policy
 import foveavla.shared.download as _download
@@ -444,7 +445,35 @@ _dual_config = dataclasses.replace(
     },
 )
 
-_CONFIGS_DICT = {_single_config.name: _single_config, _dual_config.name: _dual_config}
+
+def _efficient(config: TrainConfig) -> TrainConfig:
+    """Drop letterbox padding rows from full views and 2x2-pool depth tokens (Single: 1024 -> 520 image tokens).
+
+    Both options add no parameters: set FOVEAVLA_BASE_CHECKPOINT to a released FoveaVLA checkpoint to warm-start.
+    """
+    model = dataclasses.replace(
+        config.model,
+        full_view_patch_rows=future_bbox.letterbox_patch_rows(foveavla_config.PATCH_SIZE),
+        depth_token_pool=2,
+    )
+    return dataclasses.replace(
+        config,
+        name=f"{config.name}_efficient",
+        model=model,
+        policy_metadata=config.policy_metadata
+        | {
+            "model_name": f"{config.policy_metadata['model_name']}-Efficient",
+            "full_view_patch_rows": model.full_view_patch_rows,
+            "depth_token_pool": model.depth_token_pool,
+        },
+    )
+
+
+_CONFIGS_DICT = {
+    config.name: config
+    for config in (_single_config, _dual_config, _efficient(_single_config), _efficient(_dual_config))
+}
+CONFIG_NAMES = tuple(_CONFIGS_DICT)
 
 
 def cli() -> TrainConfig:

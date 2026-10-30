@@ -55,6 +55,8 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.70 uv run --no-sync scripts/serve.py \
 
 Follow [deployment](deployment.md) to start the robot client.
 
+See [token-efficient variants](efficiency.md) for configs that halve the image tokens per query.
+
 ## Data and weight paths
 
 Set individual variables to change the default data and weight locations:
