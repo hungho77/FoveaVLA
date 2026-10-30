@@ -320,11 +320,14 @@ class TrainConfig:
     data: DataConfigFactory = dataclasses.field(default_factory=RLDSDroidDataConfig)
 
     # PyTorch trainer only (scripts/train_pytorch.py): initial weights in FoveaVLAPytorch / openpi PI0Pytorch layout
-    # (a directory with model.safetensors, e.g. openpi's pi05_base_pytorch), and the parameter precision. "bfloat16"
-    # stores bf16 weights as openpi's PyTorch trainer does; "float32" keeps fp32 weights and runs the forward under
-    # bf16 autocast, which is closer to the JAX trainer (fp32 params, bf16 compute) and uses more memory.
+    # (a directory with model.safetensors, e.g. openpi's pi05_base_pytorch), and the parameter precision. "float32"
+    # keeps fp32 weights and optimizer state and runs the forward under bf16 autocast, as the JAX trainer does.
+    # "bfloat16" stores bf16 weights as openpi's PyTorch trainer does: half the memory, but updates smaller than a
+    # bf16 step are rounded away (most of them at warmup learning rates), so it learns much more slowly.
     pytorch_weight_path: str | None = None
-    pytorch_training_precision: str = "bfloat16"
+    pytorch_training_precision: str = "float32"
+    # Micro-batches per optimizer step; batch_size is split evenly between them (and between GPUs).
+    pytorch_gradient_accumulation_steps: int = 1
 
     # Base directory for config assets (e.g., norm stats).
     assets_base_dir: str = "./assets"
@@ -549,6 +552,8 @@ _so101_single_config = dataclasses.replace(
     save_interval=2000,
     keep_period=5000,
     fsdp_devices=1,
+    # float32 PyTorch training on one 80GB GPU: 4 micro-batches of 8 (peak 72 GiB).
+    pytorch_gradient_accumulation_steps=4,
     policy_metadata=_single_config.policy_metadata
     | {
         "model_name": "FoveaVLA-Single-SO101",
