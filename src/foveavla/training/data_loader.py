@@ -7,8 +7,7 @@ import numpy as np
 
 import foveavla.models.model as _model
 import foveavla.training.config as _config
-from foveavla.training.droid_rlds_dataset import DroidRldsDataset
-from foveavla.training.droid_foveal_dataset import DroidFovealBatchDataset
+from foveavla.training.so101_dataset import SO101FovealBatchDataset
 import foveavla.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -94,8 +93,22 @@ def create_rlds_dataset(
     *,
     shuffle: bool = False,
     repeat: bool = True,
+    seed: int = 0,
 ) -> IterableDataset:
-    # At the moment, we only support DROID for RLDS datasets.
+    if data_config.so101_store_dir is not None:
+        return SO101FovealBatchDataset(
+            data_config.so101_store_dir,
+            batch_size=batch_size,
+            action_horizon=action_horizon,
+            episodes=data_config.so101_train_episodes or None,
+            shuffle=shuffle,
+            repeat=repeat,
+            seed=seed,
+        )
+    # DROID readers need lmdb and the RLDS dependency group, so they load only on this path.
+    from foveavla.training.droid_foveal_dataset import DroidFovealBatchDataset
+    from foveavla.training.droid_rlds_dataset import DroidRldsDataset
+
     dataset = DroidRldsDataset(
         data_dir=data_config.rlds_data_dir,
         batch_size=batch_size,
@@ -169,8 +182,8 @@ def create_data_loader(
     data_config = config.data.create(config.assets_dirs, config.model)
     logging.info(f"data_config: {data_config}")
 
-    if data_config.rlds_data_dir is None:
-        raise ValueError("FoveaVLA training requires a DROID RLDS data directory.")
+    if data_config.rlds_data_dir is None and data_config.so101_store_dir is None:
+        raise ValueError("FoveaVLA training requires a DROID RLDS data directory or an SO101 store.")
     return create_rlds_data_loader(
         data_config,
         action_horizon=config.model.action_horizon,
