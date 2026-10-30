@@ -29,13 +29,29 @@ Everything below follows the JAX trainer:
 | Optimizer | AdamW (b1, b2, eps, weight decay from the config), global-norm clip, warmup + cosine schedule |
 | EMA | `ema_decay` with an fp32 shadow copy. `model.safetensors` holds the EMA weights, just as JAX saves EMA as `params` |
 | Checkpoints | `<step>/model.safetensors`, `assets/`, and `train_state/` (raw weights + optimizer). Retention follows `keep_period` |
+| Resume | Restores weights, optimizer and EMA. The data stream restarts from its seed, as in the JAX trainer |
 
-### Precision
+### Precision and memory
 
 `--pytorch-training-precision` controls how weights are stored:
-- `bfloat16` (default): weights are stored in bf16, as openpi's PyTorch trainer does.
-- `float32`: weights stay in fp32 and the forward runs under bf16 autocast. This matches the JAX trainer more
-  closely but uses more memory.
+- `float32` (default): fp32 weights, gradients, AdamW state and EMA, with the forward under bf16 autocast. This
+  matches the JAX trainer.
+- `bfloat16`: bf16 weights and AdamW state, as in openpi's PyTorch trainer. It uses about half the memory, but an
+  update smaller than half a bf16 step leaves the weight unchanged. At the warmup learning rate (2.5e-6) only about
+  2% of the weights move in a step, and at 5e-5 about a third. On the SO101 pilot it learned much more slowly than
+  JAX.
+
+In `float32` the weights, gradients, AdamW state and EMA take 54 GiB plus 13.5 GiB, which leaves little room for
+activations on an 80GB GPU. `--pytorch-gradient-accumulation-steps N` splits each batch into N equal micro-batches.
+The loss and gradient stay the same as for the full batch. `foveavla_so101_single` uses 4.
+
+SO101 pilot, batch 32, one H100, first 100 steps from `pi05_base`, same data order as the JAX pilot:
+
+| | s/step | Peak memory | Step 90 action loss | Step 90 box loss | Step 90 box IoU |
+|---|---|---|---|---|---|
+| JAX (fp32 weights, bf16 compute) | 1.8 | | 0.028 | 5.73 | 0.32 |
+| PyTorch `float32`, 4 micro-batches | 3.0 | 72 GiB | 0.030 | 5.86 | 0.25 |
+| PyTorch `bfloat16` | 2.2 | 47 GiB | 0.050 | 6.84 | 0.02 |
 
 ## Convert a JAX checkpoint
 
