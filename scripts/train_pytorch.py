@@ -33,6 +33,7 @@ import torch.distributed as dist
 
 import foveavla.models.model as _model
 from foveavla.models_pytorch.foveavla_pytorch import FoveaVLAPytorch
+from foveavla.models_pytorch.foveavla_pytorch import load_weights
 import foveavla.shared.normalize as _normalize
 import foveavla.training.config as _config
 import foveavla.training.data_loader as _data_loader
@@ -96,17 +97,6 @@ class BatchIterator:
         observation, actions = self._queue.get()
         move = lambda x: x.to(self._device, non_blocking=True)  # noqa: E731
         return jax.tree.map(move, observation), move(actions)
-
-
-def load_weights(model: torch.nn.Module, path: pathlib.Path):
-    state = safetensors.torch.load_file(str(path), device="cpu")
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    # PaliGemma's lm_head is tied to the input embedding, and checkpoints store it under only one of the two names.
-    current = model.state_dict()
-    loaded = {current[k].data_ptr() for k in state if k in current}
-    missing = [k for k in missing if current[k].data_ptr() not in loaded]
-    if missing or unexpected:
-        raise RuntimeError(f"weights at {path} do not match: missing={missing[:8]} unexpected={unexpected[:8]}")
 
 
 def save_checkpoint(config, step, model, optimizer, ema, data_config):

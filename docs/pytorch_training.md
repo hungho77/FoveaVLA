@@ -68,6 +68,11 @@ decoded box.
 
 ## Inference
 
+`policy_config.create_trained_policy` loads either kind of checkpoint. A directory with `model.safetensors` gets a
+`PytorchPolicy`, which uses bf16 weights, the same transforms, and the same `infer()` outputs as the JAX `Policy`. On
+a held-out SO101 frame, run C (JAX) and its PyTorch conversion with the same noise predict the same box. Their
+actions differ by 0.04 on average, where the open-loop MAE is about 3.
+
 `FoveaVLAPytorch` provides:
 - `prepare_inference_prefix(obs)`: encodes the observation once.
 - `sample_actions(obs, prefix=...)`: 10 Euler steps.

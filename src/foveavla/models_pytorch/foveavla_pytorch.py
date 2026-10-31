@@ -18,7 +18,9 @@ What FoveaVLA adds over π₀.₅, all mirrored from the JAX model:
 """
 
 import math
+import pathlib
 
+import safetensors.torch
 import torch
 from torch import nn
 import torch.nn.functional as F  # noqa: N812
@@ -478,3 +480,15 @@ class FoveaVLAPytorch(nn.Module):
         if self.config.future_bbox_count == 1:
             return box[:, 0], valid[:, 0]
         return box, valid
+
+
+def load_weights(model: nn.Module, path: pathlib.Path | str) -> None:
+    """Load a `model.safetensors` into `model`, checking that every parameter is covered."""
+    state = safetensors.torch.load_file(str(path), device="cpu")
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # PaliGemma's lm_head is tied to the input embedding, and checkpoints store it under only one of the two names.
+    current = model.state_dict()
+    loaded = {current[k].data_ptr() for k in state if k in current}
+    missing = [k for k in missing if current[k].data_ptr() not in loaded]
+    if missing or unexpected:
+        raise RuntimeError(f"weights at {path} do not match: missing={missing[:8]} unexpected={unexpected[:8]}")
