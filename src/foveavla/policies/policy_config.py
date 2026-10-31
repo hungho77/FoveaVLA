@@ -23,11 +23,25 @@ def create_trained_policy(
     sample_kwargs: dict[str, Any] | None = None,
     default_prompt: str | None = None,
     norm_stats: dict[str, transforms.NormStats] | None = None,
-) -> _policy.Policy:
+    pytorch_device: str | None = None,
+) -> _policy.Policy | _policy.PytorchPolicy:
+    """Load a JAX checkpoint (`params/`) or a PyTorch one (`model.safetensors`, from scripts/train_pytorch.py)."""
     repack_transforms = repack_transforms or transforms.Group()
     checkpoint_dir = download.maybe_download(str(checkpoint_dir))
     logging.info("Loading model...")
-    model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
+    is_pytorch = (checkpoint_dir / "model.safetensors").exists()
+    if is_pytorch:
+        import torch
+
+        from foveavla.models_pytorch import foveavla_pytorch
+
+        pytorch_device = pytorch_device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # bf16 weights, as the JAX path restores params in bf16.
+        model = foveavla_pytorch.FoveaVLAPytorch(train_config.model, precision="bfloat16")
+        foveavla_pytorch.load_weights(model, checkpoint_dir / "model.safetensors")
+        model.to(pytorch_device)
+    else:
+        model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_factory = dataclasses.replace(
         train_config.data,
         assets=dataclasses.replace(train_config.data.assets, assets_dir=str(checkpoint_dir / "assets")),
@@ -38,8 +52,10 @@ def create_trained_policy(
             raise ValueError("Asset id is required to load norm stats.")
         # Deployment always uses the checkpoint's own statistics.
         norm_stats = _checkpoints.load_norm_stats(checkpoint_dir / "assets", data_config.asset_id)
-    return _policy.Policy(
+    policy_kwargs = {"device": pytorch_device} if is_pytorch else {}
+    return (_policy.PytorchPolicy if is_pytorch else _policy.Policy)(
         model,
+        **policy_kwargs,
         transforms=[
             *repack_transforms.inputs,
             transforms.InjectDefaultPrompt(default_prompt),
