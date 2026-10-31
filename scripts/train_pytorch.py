@@ -33,6 +33,7 @@ import torch.distributed as dist
 
 import foveavla.models.model as _model
 from foveavla.models_pytorch.foveavla_pytorch import FoveaVLAPytorch
+from foveavla.models_pytorch.foveavla_pytorch import load_weights
 import foveavla.shared.normalize as _normalize
 import foveavla.training.config as _config
 import foveavla.training.data_loader as _data_loader
@@ -98,17 +99,6 @@ class BatchIterator:
         return jax.tree.map(move, observation), move(actions)
 
 
-def load_weights(model: torch.nn.Module, path: pathlib.Path):
-    state = safetensors.torch.load_file(str(path), device="cpu")
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    # PaliGemma's lm_head is tied to the input embedding, and checkpoints store it under only one of the two names.
-    current = model.state_dict()
-    loaded = {current[k].data_ptr() for k in state if k in current}
-    missing = [k for k in missing if current[k].data_ptr() not in loaded]
-    if missing or unexpected:
-        raise RuntimeError(f"weights at {path} do not match: missing={missing[:8]} unexpected={unexpected[:8]}")
-
-
 def save_checkpoint(config, step, model, optimizer, ema, data_config):
     final = config.checkpoint_dir / str(step)
     tmp = config.checkpoint_dir / f"tmp_{step}"
@@ -139,10 +129,15 @@ def latest_step(checkpoint_dir: pathlib.Path) -> int | None:
 
 def main(config: _config.TrainConfig):
     init_logging()
+    # float32 training fills most of an 80GB GPU, so avoid fragmentation; must be set before CUDA initializes.
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     world_size, rank, device = setup_ddp()
     is_main = rank == 0
-    if config.batch_size % world_size:
-        raise ValueError(f"batch size {config.batch_size} is not divisible by {world_size} processes")
+    if config.batch_size % (world_size * config.pytorch_gradient_accumulation_steps):
+        raise ValueError(
+            f"batch size {config.batch_size} is not divisible by {world_size} processes x "
+            f"{config.pytorch_gradient_accumulation_steps} accumulation steps"
+        )
     torch.manual_seed(config.seed + rank)
     np.random.seed(config.seed + rank)
 
@@ -189,6 +184,8 @@ def main(config: _config.TrainConfig):
     optimizer = torch.optim.AdamW(
         params, lr=lr_at(config.lr_schedule, 0), betas=(opt_cfg.b1, opt_cfg.b2), eps=opt_cfg.eps,
         weight_decay=opt_cfg.weight_decay,
+        # The fused kernel updates in place; the default foreach path allocates parameter-sized temporaries.
+        fused=device.type == "cuda",
     )
     ema = None
     if config.ema_decay is not None:
@@ -207,14 +204,17 @@ def main(config: _config.TrainConfig):
         ddp = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device.index], find_unused_parameters=True)
     model.train()
     autocast = (
-        torch.autocast("cuda", dtype=torch.bfloat16) if fp32 and device.type == "cuda" else contextlib.nullcontext()
+        # No cast cache: it would keep a bf16 copy of every weight alive through the backward pass.
+        torch.autocast("cuda", dtype=torch.bfloat16, cache_enabled=False)
+        if fp32 and device.type == "cuda"
+        else contextlib.nullcontext()
     )
 
     if is_main:
         n_params = sum(p.numel() for p in params)
         logging.info(
             f"FoveaVLA PyTorch on {platform.node()}: {n_params / 1e9:.2f}B params, precision={config.pytorch_training_precision}, "
-            f"world={world_size}, batch={config.batch_size}, steps={config.num_train_steps}, ema={config.ema_decay}"
+            f"world={world_size}, batch={config.batch_size}, accumulation={config.pytorch_gradient_accumulation_steps}, steps={config.num_train_steps}, ema={config.ema_decay}"
         )
 
     infos, t0 = [], time.time()
@@ -223,27 +223,39 @@ def main(config: _config.TrainConfig):
         lr = lr_at(config.lr_schedule, step)
         for group in optimizer.param_groups:
             group["lr"] = lr
-        with autocast:
-            losses, metrics = ddp(observation, actions, train=True)
-            loss = losses.mean()
-        loss.backward()
+        # Gradient accumulation over equal micro-batches gives the same mean loss and gradient as the full batch.
+        n_micro = config.pytorch_gradient_accumulation_steps
+        loss, micro_metrics = 0.0, []
+        for i in range(n_micro):
+            micro = lambda x: x.chunk(n_micro)[i]  # noqa: B023, E731
+            sync = contextlib.nullcontext() if i == n_micro - 1 or world_size == 1 else ddp.no_sync()
+            with sync, autocast:
+                losses, metrics = ddp(jax.tree.map(micro, observation), micro(actions), train=True)
+                micro_loss = losses.mean() / n_micro
+            with sync:
+                micro_loss.backward()
+            loss += micro_loss.detach()
+            micro_metrics.append(metrics)
+        metrics = {k: torch.stack([m[k].float() for m in micro_metrics]).mean() for k in micro_metrics[0]}
         grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=opt_cfg.clip_gradient_norm)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         if ema is not None:
             with torch.no_grad():
-                torch._foreach_mul_(ema, config.ema_decay)  # noqa: SLF001
-                torch._foreach_add_(ema, [p.detach().to(torch.float32) for p in params], alpha=1 - config.ema_decay)  # noqa: SLF001
+                # In chunks, so bf16 weights are upcast a few at a time rather than all at once.
+                for i in range(0, len(params), 64):
+                    chunk = [p.detach().to(torch.float32) for p in params[i : i + 64]]
+                    torch._foreach_lerp_(ema[i : i + 64], chunk, 1 - config.ema_decay)  # noqa: SLF001
 
         if is_main:
-            infos.append({"loss": loss.detach(), "grad_norm": grad_norm.detach(), **metrics})
+            infos.append({"loss": loss, "grad_norm": grad_norm.detach(), **metrics})
+            if step - (start or -1) <= 2 and device.type == "cuda":
+                logging.info(f"step {step}: peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GiB")
             if step % config.log_interval == 0:
                 avg = {k: torch.stack([i[k].float() for i in infos]).mean().item() for k in infos[0]}
                 avg["lr"] = lr
                 avg["s_per_step"] = (time.time() - t0) / len(infos)
                 logging.info(f"Step {step}: " + ", ".join(f"{k}={v:.4g}" for k, v in avg.items()))
-                if step < 3 and device.type == "cuda":
-                    logging.info(f"peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.1f} GiB")
                 if config.wandb_enabled:
                     import wandb
 

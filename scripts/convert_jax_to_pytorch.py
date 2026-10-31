@@ -67,10 +67,12 @@ def main(args: Args):
     model = FoveaVLAPytorch(config.model, precision=args.precision)
     state = jax_to_state_dict(os.path.abspath(args.checkpoint_dir), args.openpi_root)
     missing, unexpected = model.load_state_dict(state, strict=False)
-    # PaliGemma's lm_head is tied to the input embedding, so it loads with it.
+    # PaliGemma's lm_head is tied to the input embedding, so it loads with it. The action expert's lm_head is never
+    # used (actions come from action_out_proj), and openpi's slicer does not emit it.
     current = model.state_dict()
     loaded = {current[k].data_ptr() for k in state if k in current}
-    missing = [k for k in missing if current[k].data_ptr() not in loaded]
+    unused = {"paligemma_with_expert.gemma_expert.lm_head.weight"}
+    missing = [k for k in missing if current[k].data_ptr() not in loaded and k not in unused]
     if missing or unexpected:
         raise RuntimeError(f"missing={missing[:10]} unexpected={unexpected[:10]}")
     out = pathlib.Path(args.output_dir)
