@@ -105,7 +105,8 @@ class WebsocketPolicyServer:
                         continue
 
                     infer_time = time.monotonic()
-                    action = self._policy.infer(request)
+                    # Off the event loop so keepalive pings are answered during slow (e.g. CPU) queries.
+                    action = await asyncio.to_thread(self._policy.infer, request)
                     infer_time = time.monotonic() - infer_time
 
                     action["server_timing"] = {
