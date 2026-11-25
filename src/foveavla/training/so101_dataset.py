@@ -2,7 +2,8 @@
 
 Each batch matches what DroidFovealBatchDataset yields after the RLDS join, so the DROID repack and input transforms
 apply unchanged: one top camera (letterboxed full view + foveal crop), metric depth for both, 5 arm joints plus the
-gripper, absolute action chunks, and the future interaction box with its mask.
+gripper, absolute action chunks, and the future interaction box with its mask. Multi-task stores carry a task_index
+per frame and the task strings in store.json "prompts"; single-task stores use store.json "prompt" for every frame.
 """
 
 from collections.abc import Iterator, Sequence
@@ -31,7 +32,12 @@ class SO101FovealBatchDataset:
         if with_wrist:
             self._arrays["wrist"] = np.load(root / "wrist.npy", mmap_mode="r")
         meta = pd.read_parquet(root / "meta.parquet")
-        self._prompt = json.loads((root / "store.json").read_text())["prompt"].encode()
+        store = json.loads((root / "store.json").read_text())
+        if "task_index" in meta and "prompts" in store:
+            prompts = np.array([p.encode() for p in store["prompts"]], dtype=object)
+            self._prompt = prompts[meta["task_index"].to_numpy()]
+        else:
+            self._prompt = np.full(len(meta), store["prompt"].encode(), dtype=object)
         self._state = np.stack(meta["state"].to_numpy()).astype(np.float32)
         self._action = np.stack(meta["action"].to_numpy()).astype(np.float32)
         self._future_box = np.stack(meta["future_box"].to_numpy()).astype(np.float32)
@@ -71,7 +77,7 @@ class SO101FovealBatchDataset:
             "observation/pointmap_quality_full": a["qual"][:, 0].astype(np.float32),
             "observation/pointmap_quality_crop": a["qual"][:, 1].astype(np.float32),
             "actions": self._action[self._chunk[idx]],
-            "prompt": np.array([self._prompt] * len(idx), dtype=object),
+            "prompt": self._prompt[idx],
             "future_interaction_box": self._future_box[idx],
             "future_interaction_box_mask": self._future_mask[idx],
         }

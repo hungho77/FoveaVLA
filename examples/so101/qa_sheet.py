@@ -15,8 +15,9 @@ for p in sorted(glob.glob(f"{lab_dir}/episode_*.json")):
     for i, im in episode_frames(root, row, 1):
         if i not in keep: continue
         im = im.resize((320, 180)); d = ImageDraw.Draw(im)
-        for k, c in [("base", "magenta"), ("gripper", "yellow"), ("cube", "red"), ("drawer", "lime")]:
-            b = fr[i][k]
+        for k, c in [("base", "magenta"), ("gripper", "yellow"), ("cube", "red"), ("drawer", "lime"), ("pot", "cyan"),
+                     ("target", "blue")]:
+            b = fr[i].get(k)
             if b: d.rectangle([b[0]*320, b[1]*180, b[2]*320, b[3]*180], outline=c, width=2)
         d.rectangle([0, 0, 320, 14], fill="black"); d.text((2, 1), f"ep{L['episode_index']} f{i} {fr[i].get('phase') or ''}", fill="white")
         tiles.append(np.array(im))

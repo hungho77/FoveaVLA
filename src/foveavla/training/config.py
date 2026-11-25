@@ -565,6 +565,36 @@ _so101_single_config = dataclasses.replace(
     },
 )
 
+# The three SO101 left-arm tasks merged into one LeRobot v3.0 dataset (hungho77/so101-left-arm-task3): red cube from
+# the steel pot into the orange hollow cube (episodes 0-50), the drawer/red-block task above (51-107, identical to
+# so101_drawer), and open the drawer then stack the red cube on the blue cube (108-158). Each frame is prompted with its
+# own task. Recipe follows pi05_so101_leftarm_task3 in hungho77/openpi (the π0.5 run on the same data): batch 128,
+# 6,000 steps, cosine decayed over the run, all episodes trained except the two drawer episodes whose gripper never
+# moves (5 and 24 there, 56 and 75 here).
+_SO101_TASK3_STORE = os.environ.get(
+    "FOVEAVLA_SO101_TASK3_STORE", "/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_leftarm_task3_v30/foveavla_store"
+)
+SO101_TASK3_EXCLUDED_EPISODES = tuple(e + 51 for e in SO101_EXCLUDED_EPISODES)
+SO101_TASK3_TRAIN_EPISODES = tuple(e for e in range(159) if e not in SO101_TASK3_EXCLUDED_EPISODES)
+
+_so101_task3_config = dataclasses.replace(
+    _so101_single_config,
+    name="foveavla_so101_task3",
+    data=SO101FovealDataConfig(
+        repo_id="so101_task3",
+        store_dir=_SO101_TASK3_STORE,
+        train_episodes=SO101_TASK3_TRAIN_EPISODES,
+    ),
+    lr_schedule=_optimizer.CosineDecaySchedule(decay_steps=6_000),
+    num_train_steps=6_000,
+    batch_size=128,
+    save_interval=1000,
+    keep_period=2000,
+    # float32 PyTorch training on one 80GB GPU: 16 micro-batches of 8, as foveavla_so101_single.
+    pytorch_gradient_accumulation_steps=16,
+    policy_metadata=_so101_single_config.policy_metadata | {"model_name": "FoveaVLA-Single-SO101-Task3"},
+)
+
 _CONFIGS_DICT = {
     config.name: config
     for config in (
@@ -573,6 +603,7 @@ _CONFIGS_DICT = {
         _efficient(_single_config),
         _efficient(_dual_config),
         _so101_single_config,
+        _so101_task3_config,
     )
 }
 CONFIG_NAMES = tuple(_CONFIGS_DICT)
