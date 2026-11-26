@@ -134,7 +134,7 @@ python scripts/train_pytorch.py foveavla_so101_task3 --exp-name task3_bs128_6k \
 
 The union boxes above jump in size (they stretch with the hand-to-object distance) and 15–19% of the frames have no box,
 mostly because a gripper label was dropped. `build_focus_boxes.py` builds the boxes differently: every subtask looks at
-one target with a fixed 150 px window that does not include the gripper, and the window moves to the next target at the
+one target with a fixed window (150 px; 188 px for the pot) that does not include the gripper, and the window moves to the next target at the
 subtask boundary over 12 frames.
 
 | task | subtask → focus |
@@ -144,10 +144,15 @@ subtask boundary over 12 frames.
 | drawer | pull → drawer handle · pick → red cube · place → where the cube ends up in the drawer · push → drawer front |
 
 Objects come from LocateAnything-3B (`detect_objects.py`, every 5th frame, median per episode); it boxes the cubes and
-the pot precisely but cannot box the gripper alone, so the handle and the drawer front are the median Qwen3-VL gripper
-box while the arm pulls or pushes. Subtask boundaries come from the robot state: grasp and release from the gripper,
-pull → pick from the closed-jaw segment (stack) or from the arm leaving for the grasp pose (drawer). On five pilot
-episodes this removed every missing box and every within-subtask jump. The output has the format of `build_boxes.py`.
+the pot precisely but cannot box the gripper alone, and the Qwen3-VL gripper boxes often sit on the arm. The handle,
+the drawer front and the place inside the drawer are therefore where the gripper tip is while the arm pulls, pushes or
+releases: the tip pixel is a quadratic ridge fit from the five arm joints, trained on the moments where it is known (on
+the cube at the grasp, on the target at the release; ~13 px median error). The same fit replaces a detection that is
+more than 75 px from where the hand grasps or releases. Subtask boundaries come from the robot state: grasp and release
+from the gripper, pull → pick from the closed-jaw segment (stack) or from the arm leaving for the grasp pose (drawer).
+On the 155 episodes with a grasp, every frame has a box, every window has the same size, and no box jumps within a
+subtask. The Qwen3-VL label files are only read for the task of each episode. The output has the format of
+`build_boxes.py`.
 
 ```bash
 python examples/so101/detect_objects.py --root $DATA --tasks labels_task3 --out det_task3 \
