@@ -129,3 +129,29 @@ python scripts/compute_norm_stats.py --config-name foveavla_so101_task3
 python scripts/train_pytorch.py foveavla_so101_task3 --exp-name task3_bs128_6k \
     --pytorch-weight-path /path/to/pi05_base_pytorch --no-wandb-enabled
 ```
+
+### Subtask-focused boxes
+
+The union boxes above jump in size (they stretch with the hand-to-object distance) and 15–19% of the frames have no box,
+mostly because a gripper label was dropped. `build_focus_boxes.py` builds the boxes differently: every subtask looks at
+one target with a fixed 150 px window that does not include the gripper, and the window moves to the next target at the
+subtask boundary over 12 frames.
+
+| task | subtask → focus |
+|---|---|
+| pot | pick → pot · place, retreat → orange hollow cube |
+| stack | pull → drawer handle · pick → red cube · place, retreat → blue cube |
+| drawer | pull → drawer handle · pick → red cube · place → where the cube ends up in the drawer · push → drawer front |
+
+Objects come from LocateAnything-3B (`detect_objects.py`, every 5th frame, median per episode); it boxes the cubes and
+the pot precisely but cannot box the gripper alone, so the handle and the drawer front are the median Qwen3-VL gripper
+box while the arm pulls or pushes. Subtask boundaries come from the robot state: grasp and release from the gripper,
+pull → pick from the closed-jaw segment (stack) or from the arm leaving for the grasp pose (drawer). On five pilot
+episodes this removed every missing box and every within-subtask jump. The output has the format of `build_boxes.py`.
+
+```bash
+python examples/so101/detect_objects.py --root $DATA --tasks labels_task3 --out det_task3 \
+    --eagle /path/to/Eagle/Embodied --model /path/to/LocateAnything-3B        # needs transformers 4.57, peft, decord
+python examples/so101/build_focus_boxes.py --root $DATA --labels labels_task3 --det det_task3 --out boxes_focus
+python examples/so101/qa_video.py $DATA boxes_focus qa_focus 0,51,108
+```
