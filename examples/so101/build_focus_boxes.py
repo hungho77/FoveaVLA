@@ -2,8 +2,9 @@
 
 build_boxes.py takes the union of the gripper and object boxes, so the box grows and shrinks with the distance between
 the hand and the object and inherits every frame-to-frame error of the gripper labels. Here the window does not contain
-the gripper on purpose: it sits on the object the current subtask is about (the hand enters it when it gets there), it
-has one size, and it moves to the next target at the subtask boundary over a short "saccade".
+the gripper on purpose: it sits on the object the current subtask is about (the hand enters it when it gets there) and
+it has one size per focus. At a subtask boundary the window moves to the next target over --saccade frames, eased,
+starting AT the boundary: the grasp or release is finished before the eye leaves it.
 
   task    subtask -> focus
   pot     pick -> pot | place, retreat -> orange hollow cube
@@ -26,7 +27,8 @@ joints through a quadratic ridge fit (TipModel) on the moments where the tip pos
 the red cube, at the release on the place target. Leave-one-out error of that fit: ~15 px median on 640x360.
 The same fit checks the detections: a cube / target detected more than OFF px from where the hand grasps / releases is
 replaced by the tip position (summary column from_tip).
-The window size does not depend on the detected box: one size per focus, the same in every episode.
+The window size does not depend on the detected box: one size per focus, the same in every episode. build_store.py
+crops 1.5x the window (context_scale), so the default 100 px window is a 150 px foveal crop of the 640x360 view.
 
 Output: the same files as build_boxes.py (episode_XXX.parquet, summary.csv), so build_store.py and the QA scripts work
 unchanged.
@@ -47,10 +49,15 @@ DEPART = 0.9
 FOCUS = {"pot": {"pick": "pot", "place": "target", "retreat": "target"},
          "stack": {"pull": "handle", "pick": "cube", "place": "target", "retreat": "target"},
          "drawer": {"pull": "handle", "pick": "cube", "place": "dest", "push": "front"}}
-TIP = {"handle": ("pull", 0.6, 1.0), "front": ("push", 0.3, 0.8)}  # tip foci: phase, part of the phase
+# Foci located through the gripper tip: phase, and the part of the phase whose median tip position is the focus.
+# Following the tip frame by frame was tried and dropped: away from grasp / release poses the fit is off by ~30 px
+# median (>75 px for a quarter of the frames, checked against the carried cube), so the window wandered off the drawer.
+TIP = {"handle": ("pull", 0.6, 1.0), "front": ("push", 0.3, 0.8)}
 COLUMN = {"handle": "drawer", "front": "drawer", "dest": "target"}  # role column the focus is stored under
 OFF = 75  # px: a detected focus farther than this from the gripper tip at the grasp / release is replaced by the tip
-SCALE = {"pot": 1.25}  # the pot is ~125 px wide; every other focus fits the plain --side window
+# Window side as a multiple of --side: the pot is ~125 px wide, and the tip-located foci need room for the error of
+# the tip fit and for the travel of the drawer.
+SCALE = {"pot": 1.25, "handle": 1.2, "front": 1.2, "dest": 1.2}
 ALL_PHASES = ("pull", "pick", "place", "push", "retreat")
 
 
@@ -67,13 +74,6 @@ def median_box(det, key, lo, hi, small=True):
     c = (v[:, :2] + v[:, 2:]) / 2
     keep = np.abs(c - np.median(c, 0)).max(1) < 0.05
     return np.median(v[keep], 0) if keep.sum() >= 2 else None
-
-
-def window(b, s):
-    """Square window of side s pixels centered on box b, kept inside the image."""
-    cx, cy = (b[0] + b[2]) / 2 * W, (b[1] + b[3]) / 2 * H
-    cx, cy = np.clip(cx, s / 2, W - s / 2), np.clip(cy, s / 2, H - s / 2)
-    return np.array([(cx - s / 2) / W, (cy - s / 2) / H, (cx + s / 2) / W, (cy + s / 2) / H], np.float32)
 
 
 def split_phases(task, state, t_grasp, t_release):
@@ -125,8 +125,8 @@ def main():
     ap.add_argument("--labels", required=True, help="labels_raw: the task of each episode")
     ap.add_argument("--det", required=True, help="detect_objects.py output")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--side", type=float, default=150, help="window side in pixels of the 640x360 top view")
-    ap.add_argument("--saccade", type=int, default=12, help="frames over which the window moves to the next target")
+    ap.add_argument("--side", type=float, default=100, help="window side in pixels of the 640x360 top view")
+    ap.add_argument("--saccade", type=int, default=30, help="frames over which the window moves to the next target")
     ap.add_argument("--episodes", default=None, help="comma-separated: write only these (the tip fit uses all)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -195,22 +195,31 @@ def main():
             if (obj.get(k) is None or far) and (k in ("cube", "pot", "dest") or t_release < n - 1):
                 obj[k] = point(at[k])
                 fixed.append(k)
-        for k, (phase, lo, hi) in TIP.items():
-            idx = np.where(ph == phase)[0]
-            idx = idx[int(len(idx) * lo):max(int(len(idx) * hi), int(len(idx) * lo) + 1)]
-            if k in need and len(idx):
-                obj[k] = point(np.median(tip(state[idx, :5]), 0))
-
         names = np.array([FOCUS[task][x] for x in ph])
-        box = np.full((n, 4), np.nan, np.float32)
+        ctr = np.full((n, 2), np.nan)  # window center in pixels
+        side = np.full(n, np.nan)
         for k in need:
             if obj.get(k) is not None:
-                box[names == k] = window(obj[k], a.side * SCALE.get(k, 1))
+                ctr[names == k], side[names == k] = center(obj[k]), a.side * SCALE.get(k, 1)
+        for k, (phase, lo, hi) in TIP.items():
+            idx = np.where(ph == phase)[0]
+            part = idx[int(len(idx) * lo):max(int(len(idx) * hi), int(len(idx) * lo) + 1)]
+            if k in need and len(part):
+                obj[k] = point(np.median(tip(state[part, :5]), 0))
+                ctr[idx], side[idx] = center(obj[k]), a.side * SCALE.get(k, 1)
+        # Saccades: from the boundary on, ease from where the window was to where the new subtask wants it.
         for i in np.where(names[1:] != names[:-1])[0] + 1:
-            lo, hi = max(i - a.saccade // 2, 0), min(i + a.saccade // 2, n - 1)
-            if np.isfinite(box[lo]).all() and np.isfinite(box[hi]).all():
-                w = ((np.arange(lo, hi + 1) - lo) / (hi - lo))[:, None]
-                box[lo:hi + 1] = (1 - w) * box[lo] + w * box[hi]
+            if not (np.isfinite(ctr[i - 1]).all() and np.isfinite(ctr[i]).all()):
+                continue
+            hi = min(i + a.saccade, n)
+            w = (np.arange(i, hi) - i + 1) / a.saccade
+            w = (w * w * (3 - 2 * w))[:, None]
+            start = np.r_[ctr[i - 1], side[i - 1]]
+            moved = (1 - w) * start + w * np.c_[ctr[i:hi], side[i:hi]]
+            ctr[i:hi], side[i:hi] = moved[:, :2], moved[:, 2]
+        cx, cy = np.clip(ctr[:, 0], side / 2, W - side / 2), np.clip(ctr[:, 1], side / 2, H - side / 2)
+        box = np.stack([(cx - side / 2) / W, (cy - side / 2) / H, (cx + side / 2) / W, (cy + side / 2) / H], 1)
+        box = box.astype(np.float32)
         valid = np.isfinite(box).all(1)
         out = pd.DataFrame(dict(frame_index=np.arange(n), phase=ph.astype(str), x1=box[:, 0], y1=box[:, 1],
                                 x2=box[:, 2], y2=box[:, 3], valid=valid))

@@ -105,6 +105,7 @@ def main():
                 f = t + REPLAN
                 rows.append(dict(mode=mode, episode=e, t=t, mae=float(err.mean()), mae_exec=float(err[:REPLAN].mean()),
                                  **{f"mae_j{j}": float(err[:, j].mean()) for j in range(6)}, box_valid=pv,
+                                 **dict(zip(("px1", "py1", "px2", "py2"), map(float, pb))),
                                  iou=float(iou(pb, gt_box[f])) if (pv and f < n and gt_valid[f]) else np.nan))
             if errs:
                 d_ = np.concatenate(errs)
