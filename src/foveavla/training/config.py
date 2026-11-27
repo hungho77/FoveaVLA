@@ -78,6 +78,8 @@ class DataConfig:
     # SO101 store from so101_port/build_store.py; when set, it replaces the DROID RLDS pipeline.
     so101_store_dir: str | None = None
     so101_train_episodes: tuple[int, ...] = ()
+    # Range of the frame lag of the motion image; None when the model has no motion stream.
+    so101_motion_lag: tuple[int, int] | None = None
 
 
 class GroupFactory(Protocol):
@@ -254,6 +256,8 @@ class SO101FovealDataConfig(DataConfigFactory):
 
     store_dir: str | None = None
     train_episodes: tuple[int, ...] = ()
+    # Training draws the frame lag of the motion image from this range (used when the model has a motion stream).
+    motion_lag: tuple[int, int] = (4, 16)
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -261,6 +265,9 @@ class SO101FovealDataConfig(DataConfigFactory):
             raise ValueError("Set the SO101 store directory")
         if model_config.future_bbox_count != 1 or model_config.image_keys != ("base_0_rgb", "left_wrist_0_rgb"):
             raise ValueError("The SO101 store has one top camera: one full view, one foveal crop, one future box")
+        has_motion = getattr(model_config, "motion_image_key", None) is not None
+        if has_motion and model_config.motion_image_key != so101_policy.MOTION_IMAGE_KEY:
+            raise ValueError(f"The SO101 motion image is stored under '{so101_policy.MOTION_IMAGE_KEY}'")
         keys = [
             "observation/exterior_image_1_left",
             "observation/foveal_image",
@@ -272,9 +279,11 @@ class SO101FovealDataConfig(DataConfigFactory):
             "future_interaction_box_mask",
         ]
         keys += [f"observation/{f}_{s}" for s in ("full", "crop") for f in ("metric_depth", "pointmap_quality")]
+        if has_motion:
+            keys.append("observation/motion_image")
         data_transforms = _transforms.Group(
             inputs=[
-                droid_policy.DroidInputs(),
+                so101_policy.SO101MotionInputs() if has_motion else droid_policy.DroidInputs(),
                 _transforms.DeltaActions(_transforms.make_bool_mask(5, -1)),
             ],
             outputs=[
@@ -289,6 +298,7 @@ class SO101FovealDataConfig(DataConfigFactory):
             model_transforms=ModelTransformFactory()(model_config),
             so101_store_dir=self.store_dir,
             so101_train_episodes=self.train_episodes,
+            so101_motion_lag=self.motion_lag if has_motion else None,
         )
 
 
@@ -595,6 +605,44 @@ _so101_task3_config = dataclasses.replace(
     policy_metadata=_so101_single_config.policy_metadata | {"model_name": "FoveaVLA-Single-SO101-Task3"},
 )
 
+# Drawer + stack only (episodes 51-158 of the same dataset), with the subtask-focused boxes of
+# examples/so101/build_focus_boxes.py. The pot task is left out: the top camera does not see the cube inside the pot
+# in about half of its episodes. Same recipe as foveavla_so101_task3. Five episodes per task are held out (seeded:
+# rng(0).choice of the valid ones, drawer first), and episode 136 is skipped too (no grasp, so no boxes).
+_SO101_TASK2_STORE = os.environ.get(
+    "FOVEAVLA_SO101_TASK2_STORE", "/mnt/data/sftp/data/hunght23/DATA_ZOO/so101_leftarm_task3_v30/foveavla_store_focus4"
+)
+SO101_TASK2_HELDOUT_EPISODES = (66, 68, 80, 86, 96, 132, 139, 146, 152, 158)
+SO101_TASK2_EXCLUDED_EPISODES = (*SO101_TASK3_EXCLUDED_EPISODES, 136)
+SO101_TASK2_TRAIN_EPISODES = tuple(
+    e for e in range(51, 159) if e not in SO101_TASK2_HELDOUT_EPISODES + SO101_TASK2_EXCLUDED_EPISODES
+)
+
+_so101_task2_config = dataclasses.replace(
+    _so101_task3_config,
+    name="foveavla_so101_task2",
+    data=SO101FovealDataConfig(
+        repo_id="so101_task2",
+        store_dir=_SO101_TASK2_STORE,
+        train_episodes=SO101_TASK2_TRAIN_EPISODES,
+    ),
+    policy_metadata=_so101_single_config.policy_metadata | {"model_name": "FoveaVLA-Single-SO101-Task2"},
+)
+
+# foveavla_so101_task2 plus the motion stream: 40 extra prefix tokens from the motion image of the top view against
+# the frame 4-16 steps earlier (lag drawn per sample), dropped in a quarter of the training samples. PyTorch only.
+_so101_task2_motion_config = dataclasses.replace(
+    _so101_task2_config,
+    name="foveavla_so101_task2_motion",
+    model=dataclasses.replace(_so101_task2_config.model, motion_image_key=so101_policy.MOTION_IMAGE_KEY),
+    policy_metadata=_so101_task2_config.policy_metadata
+    | {
+        "model_name": "FoveaVLA-Single-SO101-Task2-Motion",
+        "motion_image": "signed_luminance_difference_v1",
+        "motion_image_lag_frames": (4, 16),
+    },
+)
+
 _CONFIGS_DICT = {
     config.name: config
     for config in (
@@ -604,6 +652,8 @@ _CONFIGS_DICT = {
         _efficient(_dual_config),
         _so101_single_config,
         _so101_task3_config,
+        _so101_task2_config,
+        _so101_task2_motion_config,
     )
 }
 CONFIG_NAMES = tuple(_CONFIGS_DICT)

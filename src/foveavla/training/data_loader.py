@@ -101,6 +101,7 @@ def create_rlds_dataset(
             batch_size=batch_size,
             action_horizon=action_horizon,
             episodes=data_config.so101_train_episodes or None,
+            motion_lag=data_config.so101_motion_lag,
             shuffle=shuffle,
             repeat=repeat,
             seed=seed,

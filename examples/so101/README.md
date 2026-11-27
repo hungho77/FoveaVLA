@@ -167,3 +167,49 @@ python examples/so101/build_focus_boxes.py --root $DATA --labels labels_task3 --
     --out boxes_focus
 python examples/so101/qa_video.py $DATA boxes_focus qa_focus 0,51,108
 ```
+
+### Two tasks, held-out episodes
+
+`foveavla_so101_task2` trains drawer + stack only (episodes 51–158) on a store built from the focus boxes, with the
+recipe above. It holds out five episodes per task (`SO101_TASK2_HELDOUT_EPISODES`: 66, 68, 80, 86, 96 and 132, 139,
+146, 152, 158) and skips 56, 75 and 136 (no grasp), which leaves 95 training episodes. The store still holds all 159
+episodes; the config picks the ones to train on.
+
+```bash
+export FOVEAVLA_SO101_TASK2_STORE=/path/to/foveavla_store_focus
+python examples/so101/build_store.py --root $DATA --boxes boxes_focus --out $FOVEAVLA_SO101_TASK2_STORE \
+    --key-prefix so101_task3 --no-wrist
+python scripts/compute_norm_stats.py --config-name foveavla_so101_task2
+python scripts/train_pytorch.py foveavla_so101_task2 --exp-name task2_bs128_6k \
+    --pytorch-weight-path /path/to/pi05_base_pytorch --no-wandb-enabled
+python examples/so101/eval_foveavla.py --root $DATA --boxes boxes_focus --config foveavla_so101_task2 \
+    --checkpoint checkpoints/foveavla_so101_task2/task2_bs128_6k/5999 --out eval/task2 \
+    --episodes 66 68 80 86 96 132 139 146 152 158 --steps 400
+```
+
+### Motion stream
+
+A single frame does not say whether the arm is moving, which way, or how long it has been still, and the open-loop
+error of the focus-box model sits at those moments (the start of a motion, closing and opening the gripper).
+`foveavla_so101_task2_motion` adds a third visual stream for it, modelled on the rods of the eye: wide, coarse,
+colour-blind, sensitive to change.
+
+- **Motion image** (`foveavla.shared.motion`): signed luminance difference between the letterboxed top view and the
+  same view a few frames earlier, 3×3 blurred, differences under 4 grey levels set to zero (static frames differ by
+  up to ~6 before that, a moving arm by 50–110). Grey means still.
+- **Tokens**: the shared SigLIP encodes it; the model keeps the 10 patch rows with image content and mean-pools 2×2,
+  so the stream costs 40 prefix tokens (the other four streams take 1,024). No parameters are added, and
+  `pi05_base` loads unchanged. PyTorch model only.
+- **Training**: the lag is drawn per sample from 4–16 frames (the dataset computes the image from the stored full
+  views, so the store is the one above). The stream is dropped in 25% of the samples, which keeps the model usable
+  without it and limits the "keep doing what you were doing" shortcut that history inputs invite.
+- **Inference**: `SO101MotionInputs` builds the image from the full view of the previous `infer` call, so a client
+  that replans every 4–16 frames needs no change. The first call, a call more than 3 s after the last one, or a
+  sample with `"reset": True` sees a still image. A client can instead send `observation/exterior_image_1_left_prev`
+  or a ready `observation/motion_image`; `observation/motion_image_mask: False` hides the stream.
+
+```bash
+python scripts/train_pytorch.py foveavla_so101_task2_motion --exp-name task2_motion_bs128_6k \
+    --pytorch-weight-path /path/to/pi05_base_pytorch --no-wandb-enabled
+python examples/so101/eval_foveavla.py ... --config foveavla_so101_task2_motion [--motion off] [--motion-lag 8]
+```

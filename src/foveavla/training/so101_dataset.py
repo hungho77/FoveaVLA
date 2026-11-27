@@ -4,6 +4,10 @@ Each batch matches what DroidFovealBatchDataset yields after the RLDS join, so t
 apply unchanged: one top camera (letterboxed full view + foveal crop), metric depth for both, 5 arm joints plus the
 gripper, absolute action chunks, and the future interaction box with its mask. Multi-task stores carry a task_index
 per frame and the task strings in store.json "prompts"; single-task stores use store.json "prompt" for every frame.
+
+With `motion_lag=(lo, hi)` each sample also carries the motion image of its full view (foveavla.shared.motion) against
+the frame `lag` steps earlier in the same episode, `lag` drawn uniformly from lo..hi per sample (the first frame of the
+episode when the sample is closer to the start than that).
 """
 
 from collections.abc import Iterator, Sequence
@@ -12,6 +16,8 @@ import pathlib
 
 import numpy as np
 import pandas as pd
+
+from foveavla.shared import motion
 
 
 class SO101FovealBatchDataset:
@@ -26,6 +32,7 @@ class SO101FovealBatchDataset:
         repeat: bool = True,
         seed: int = 0,
         with_wrist: bool = False,
+        motion_lag: tuple[int, int] | None = None,
     ):
         root = pathlib.Path(store_dir)
         self._arrays = {k: np.load(root / f"{k}.npy", mmap_mode="r") for k in ("full", "crop", "depth", "qual")}
@@ -45,6 +52,8 @@ class SO101FovealBatchDataset:
         episode = meta["episode_index"].to_numpy()
         # Last frame of each sample's episode, for chunks that run past the end (repeat the final action, as DROID).
         last = pd.Series(np.arange(len(meta))).groupby(episode).transform("max").to_numpy()
+        self._first = pd.Series(np.arange(len(meta))).groupby(episode).transform("min").to_numpy()
+        self._motion_lag = motion_lag
         self._chunk = np.minimum(np.arange(len(meta))[:, None] + np.arange(action_horizon)[None], last[:, None])
         keep = np.ones(len(meta), bool) if episodes is None else np.isin(episode, np.asarray(episodes))
         self._indices = np.flatnonzero(keep)
@@ -83,4 +92,8 @@ class SO101FovealBatchDataset:
         }
         if self._with_wrist:
             batch["observation/wrist_image_left"] = a["wrist"]
+        if self._motion_lag is not None:
+            lag = self._rng.integers(self._motion_lag[0], self._motion_lag[1] + 1, len(idx))
+            earlier = np.maximum(idx - lag, self._first[idx])
+            batch["observation/motion_image"] = motion.motion_image(a["full"], self._arrays["full"][earlier])
         return batch

@@ -10,6 +10,9 @@ label at t+REPLAN where that label is valid.
 summary also holds the open-loop MSE/MAE of openpi's scripts/eval_so101_open_loop.py (the gr00t protocol: chunks tiled
 over the first --steps frames, one error per episode, mean over episodes), for comparison with the pi0.5 runs.
 
+A model with a motion stream gets the motion image of the full view against the frame --motion-lag steps earlier (a
+still image at the start of the episode); --motion off hides the stream from the model instead.
+
 Run from the repo root with PYTHONPATH=src:packages/foveavla-client/src:examples/so101 (see README.md).
 """
 import argparse, glob, json, os
@@ -18,6 +21,7 @@ import numpy as np, pandas as pd
 import build_store as bs
 from build_store import rd, _sample_aligned_depth
 from foveavla.policies import policy_config
+from foveavla.shared import motion as _motion
 from foveavla.training import config as _config
 
 REPLAN = 8
@@ -31,7 +35,7 @@ def iou(a, b):
     return inter / union if union > 0 else 0.0
 
 
-def obs_for(img, depth, dvalid, state, prompt, box):
+def obs_for(img, depth, dvalid, state, prompt, box, earlier=None, motion_on=True):
     if box is None:
         mode, cb = rd.CROP_MODE_FULL, (0, 0, img.shape[1], img.shape[0])
     else:
@@ -40,7 +44,11 @@ def obs_for(img, depth, dvalid, state, prompt, box):
     crop = full if mode == rd.CROP_MODE_FULL else rd.render_square_crop(img, cb, bs.OUT)
     fd, fv = _sample_aligned_depth(depth, dvalid, bs.OUT, crop_bbox=None)
     cd, cv = (fd, fv) if mode == rd.CROP_MODE_FULL else _sample_aligned_depth(depth, dvalid, bs.OUT, crop_bbox=cb)
-    return {
+    extra = {}
+    if earlier is not None:
+        extra = {"observation/motion_image": _motion.motion_image(full, rd.resize_with_pad(earlier, bs.OUT)),
+                 "observation/motion_image_mask": motion_on}
+    return extra | {
         "observation/exterior_image_1_left": full,
         "observation/foveal_image": crop,
         "observation/joint_position": state[:5],
@@ -64,9 +72,12 @@ def main():
     ap.add_argument("--episodes", type=int, nargs="+", default=list(_config.SO101_HELDOUT_EPISODES))
     ap.add_argument("--steps", type=int, default=None, help="also report the tiled open-loop MSE/MAE over this many frames")
     ap.add_argument("--norm-std", type=float, default=None, help="absolute action std, for the normalized MAE")
+    ap.add_argument("--motion-lag", type=int, default=REPLAN, help="frame lag of the motion image (motion models)")
+    ap.add_argument("--motion", choices=("on", "off"), default="on", help="off: hide the motion stream from the model")
     a = ap.parse_args()
     cfg = _config.get_config(a.config)
     policy = policy_config.create_trained_policy(cfg, a.checkpoint)
+    has_motion = getattr(cfg.model, "motion_image_key", None) is not None
     info = json.load(open(f"{a.root}/meta/info.json"))["features"]["observation.images.top_depth"]["info"]
     prompts = pd.read_parquet(f"{a.root}/meta/tasks.parquet").sort_values("task_index").index.tolist()
     eps = pd.concat([pd.read_parquet(f) for f in sorted(glob.glob(f"{a.root}/meta/episodes/chunk-*/*.parquet"))])
@@ -93,7 +104,9 @@ def main():
             for t in range(0, n, REPLAN):
                 depth, dvalid = bs.dequantize(vids["top_depth"][t], info)
                 box = prev if mode == "self" else (gt_box[t] if gt_valid[t] else None)
-                out = policy.infer(obs_for(vids["top"][t], depth, dvalid, state[t], prompt, box))
+                earlier = vids["top"][max(t - a.motion_lag, 0)] if has_motion else None
+                out = policy.infer(obs_for(vids["top"][t], depth, dvalid, state[t], prompt, box, earlier,
+                                           a.motion == "on"))
                 chunk = np.asarray(out["actions"])
                 target = action[np.minimum(np.arange(t, t + len(chunk)), n - 1)]
                 err = np.abs(chunk - target)
@@ -118,6 +131,8 @@ def main():
     summary = {m: {k: float(g[k].mean()) for k in ["mae", "mae_exec"] + [f"mae_j{j}" for j in range(6)] + ["box_valid", "iou"]}
                | {"queries": int(len(g))} for m, g in R.groupby("mode")}
     result = {"checkpoint": a.checkpoint, "episodes": list(a.episodes), "replan": REPLAN, "summary": summary}
+    if has_motion:
+        result["motion"] = {"lag": a.motion_lag, "stream": a.motion}
     if tiled:
         T = pd.DataFrame(tiled)
         T.to_csv(f"{a.out}/open_loop.csv", index=False)

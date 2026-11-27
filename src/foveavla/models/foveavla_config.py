@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from typing_extensions import override
 
+from foveavla.models import future_bbox
 from foveavla.models import gemma
 from foveavla.models import model as _model
 from foveavla.shared import array_typing as at
@@ -43,6 +44,13 @@ class FoveaVLAConfig(_model.BaseModelConfig):
     full_view_patch_rows: tuple[int, int] | None = None
     # Mean-pool depth tokens over k×k patch windows before the language model.
     depth_token_pool: int = 1
+    # Optional motion stream (PyTorch model only): the `images` entry holding the motion image of the first full view
+    # (foveavla.shared.motion). It is encoded by the shared SigLIP, cut to the letterbox content rows and mean-pooled
+    # over k×k patch windows (10×16 -> 5×8 = 40 tokens), and placed after the depth tokens. Training drops the whole
+    # stream with probability `motion_dropout_prob`, so the model also works without it. No parameters are added.
+    motion_image_key: str | None = None
+    motion_token_pool: int = 2
+    motion_dropout_prob: float = 0.25
 
     def __post_init__(self):
         if not self.depth_image_keys or not set(self.depth_image_keys).issubset(self.image_keys):
@@ -61,6 +69,14 @@ class FoveaVLAConfig(_model.BaseModelConfig):
             rows, columns = self.patch_grid(key)
             if rows % self.depth_token_pool or columns % self.depth_token_pool:
                 raise ValueError(f"depth_token_pool must divide the {rows}x{columns} patch grid of {key}")
+        if self.motion_image_key is not None:
+            if self.motion_image_key in self.image_keys:
+                raise ValueError("motion_image_key must not be one of image_keys")
+            if not 0 <= self.motion_dropout_prob < 1:
+                raise ValueError("motion_dropout_prob must be in [0, 1)")
+            rows, columns = self.motion_patch_grid()
+            if self.motion_token_pool < 1 or rows % self.motion_token_pool or columns % self.motion_token_pool:
+                raise ValueError(f"motion_token_pool must divide the {rows}x{columns} motion patch grid")
 
     def patch_rows(self, key: str) -> tuple[int, int] | None:
         """Kept SigLIP patch rows for an image slot, or None to keep all rows."""
@@ -69,6 +85,14 @@ class FoveaVLAConfig(_model.BaseModelConfig):
     def patch_grid(self, key: str) -> tuple[int, int]:
         rows = self.patch_rows(key)
         return (PATCH_GRID_SIZE if rows is None else rows[1] - rows[0]), PATCH_GRID_SIZE
+
+    def motion_patch_rows(self) -> tuple[int, int]:
+        """SigLIP patch rows [start, stop) of the motion image that hold image content (the rest is letterbox)."""
+        return future_bbox.letterbox_patch_rows(PATCH_SIZE)
+
+    def motion_patch_grid(self) -> tuple[int, int]:
+        start, stop = self.motion_patch_rows()
+        return stop - start, PATCH_GRID_SIZE
 
     def image_token_counts(self) -> dict[str, int]:
         """Language-model prefix tokens per visual stream, keyed by `rgb/<slot>` and `depth/<slot>`."""
@@ -79,6 +103,9 @@ class FoveaVLAConfig(_model.BaseModelConfig):
         for key in self.depth_image_keys:
             rows, columns = self.patch_grid(key)
             counts[f"depth/{key}"] = rows * columns // self.depth_token_pool**2
+        if self.motion_image_key is not None:
+            rows, columns = self.motion_patch_grid()
+            counts[f"motion/{self.motion_image_key}"] = rows * columns // self.motion_token_pool**2
         return counts
 
     @property
@@ -90,6 +117,8 @@ class FoveaVLAConfig(_model.BaseModelConfig):
     def create(self, rng: at.KeyArrayLike) -> "FoveaVLA":
         from foveavla.models.foveavla import FoveaVLA
 
+        if self.motion_image_key is not None:
+            raise NotImplementedError("The motion stream is implemented in the PyTorch model only")
         return FoveaVLA(self, rngs=nnx.Rngs(rng))
 
     @override

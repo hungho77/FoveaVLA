@@ -13,6 +13,9 @@ What FoveaVLA adds over π₀.₅, all mirrored from the JAX model:
   (`token_ar_mask`), trained with cross-entropy over the 1024 location rows of the tied embedding table;
 * action tokens never attend to the box tokens, and their positions skip them (`make_joint_attn_mask`,
   `make_joint_positions`);
+* optionally (`motion_image_key`, PyTorch only) a motion stream: the motion image of the full view goes through the
+  shared SigLIP, is cut to the letterbox content rows and mean-pooled to 40 tokens that follow the depth tokens;
+  training drops the stream with probability `motion_dropout_prob`;
 * training-time color jitter is augmax's `ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5)` (default hue 0.1,
   p 0.5; augmax's saturation step is a no-op), with no geometric augmentation.
 """
@@ -28,6 +31,7 @@ import torch.nn.functional as F  # noqa: N812
 from foveavla.models import future_bbox
 import foveavla.models.foveavla as _jax_foveavla
 import foveavla.models.gemma as _gemma
+from foveavla.models.foveavla_config import PATCH_GRID_SIZE
 from foveavla.models.foveavla_config import FoveaVLAConfig
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 
@@ -277,6 +281,16 @@ class FoveaVLAPytorch(nn.Module):
         hidden = torch.where(keep, hidden, torch.zeros_like(hidden))
         return paligemma.model.multi_modal_projector(hidden)
 
+    def _pool_motion_tokens(self, emb: torch.Tensor) -> torch.Tensor:
+        """[B, 256, D] patch tokens -> letterbox content rows, mean-pooled over k×k patch windows."""
+        start, stop = self.config.motion_patch_rows()
+        pool = self.config.motion_token_pool
+        batch, _, width = emb.shape
+        side = PATCH_GRID_SIZE
+        grid = emb.reshape(batch, side, side, width)[:, start:stop]
+        grid = grid.reshape(batch, (stop - start) // pool, pool, side // pool, pool, width).mean(dim=(2, 4))
+        return grid.reshape(batch, -1, width)
+
     def embed_language_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
         emb = self._llm.embed_tokens(tokens)
         return emb * math.sqrt(emb.shape[-1])
@@ -320,6 +334,18 @@ class FoveaVLAPytorch(nn.Module):
             tokens.append(self.embed_image(depth_image, token_mask=patch_valid))
             input_mask.append(patch_valid)
             ar_mask.append(torch.zeros_like(patch_valid))
+
+        key = self.config.motion_image_key
+        if key is not None:
+            if key not in observation.images:
+                raise ValueError(f"The model has a motion stream but the observation has no '{key}' image")
+            emb = self._pool_motion_tokens(self.embed_image(observation.images[key]))
+            keep = observation.image_masks.get(key, torch.ones(batch, dtype=torch.bool, device=device))
+            if train and self.config.motion_dropout_prob:
+                keep = keep & (torch.rand(batch, device=device) >= self.config.motion_dropout_prob)
+            tokens.append(emb)
+            input_mask.append(keep[:, None].expand(-1, emb.shape[1]))
+            ar_mask.append(torch.zeros(emb.shape[:2], dtype=torch.bool, device=device))
 
         tokens.append(self._ckpt(self.embed_language_tokens, observation.tokenized_prompt))
         input_mask.append(observation.tokenized_prompt_mask.to(torch.bool))
