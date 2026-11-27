@@ -134,8 +134,9 @@ python scripts/train_pytorch.py foveavla_so101_task3 --exp-name task3_bs128_6k \
 
 The union boxes above jump in size (they stretch with the hand-to-object distance) and 15–19% of the frames have no box,
 mostly because a gripper label was dropped. `build_focus_boxes.py` builds the boxes differently: every subtask looks at
-one target with a fixed window (150 px; 188 px for the pot) that does not include the gripper, and the window moves to the next target at the
-subtask boundary over 12 frames.
+one target with a fixed window that does not include the gripper (100 px of the 640×360 view for a cube, 120 px for a
+drawer focus, 125 px for the pot; `build_store.py` crops 1.5× that). At a subtask boundary the window moves to the next
+target over 30 frames, eased, starting at the boundary, so a grasp or release is finished before the eye leaves it.
 
 | task | subtask → focus |
 |---|---|
@@ -143,20 +144,26 @@ subtask boundary over 12 frames.
 | stack | pull → drawer handle · pick → red cube · place, retreat → blue cube |
 | drawer | pull → drawer handle · pick → red cube · place → where the cube ends up in the drawer · push → drawer front |
 
-Objects come from LocateAnything-3B (`detect_objects.py`, every 5th frame, median per episode); it boxes the cubes and
-the pot precisely but cannot box the gripper alone, and the Qwen3-VL gripper boxes often sit on the arm. The handle,
-the drawer front and the place inside the drawer are therefore where the gripper tip is while the arm pulls, pushes or
-releases: the tip pixel is a quadratic ridge fit from the five arm joints, trained on the moments where it is known (on
-the cube at the grasp, on the target at the release; ~13 px median error). The same fit replaces a detection that is
-more than 75 px from where the hand grasps or releases. Subtask boundaries come from the robot state: grasp and release
-from the gripper, pull → pick from the closed-jaw segment (stack) or from the arm leaving for the grasp pose (drawer).
-On the 155 episodes with a grasp, every frame has a box, every window has the same size, and no box jumps within a
-subtask. The Qwen3-VL label files are only read for the task of each episode. The output has the format of
-`build_boxes.py`.
+Where each focus comes from:
+
+- **Red and blue cube**: colour (`color_track.py`). More precise than a detector and it sees the cube inside the
+  translucent drawer. Clusters much smaller than the cube are ignored (the arm's red servo wires, a blue sticker).
+- **Pot, orange cube**: LocateAnything-3B (`detect_objects.py`, every 5th frame, median per episode).
+- **Drawer handle and drawer front**: where the gripper tip is while the arm pulls / pushes. The tip pixel is a
+  quadratic ridge fit from the five arm joints, trained on the moments where it is known: on the cube at the grasp, on
+  the target at the release, and on the cube's colour while it is carried (~15 px median error on held-out episodes at
+  grasp / release poses, ~23 px in transit). This is the weakest focus: there is no direct evidence for the handle.
+- **Subtask boundaries**: robot state. Grasp and release from the gripper, pull → pick from the closed-jaw segment
+  (stack) or from the arm leaving for the grasp pose (drawer).
+
+In the pot task the top camera does not see the cube inside the pot in about half of the episodes (the arm starts
+above it), so the top-only model cannot learn that grasp; train drawer + stack without it.
 
 ```bash
 python examples/so101/detect_objects.py --root $DATA --tasks labels_task3 --out det_task3 \
     --eagle /path/to/Eagle/Embodied --model /path/to/LocateAnything-3B        # needs transformers 4.57, peft, decord
-python examples/so101/build_focus_boxes.py --root $DATA --labels labels_task3 --det det_task3 --out boxes_focus
+python examples/so101/color_track.py --root $DATA --out color_task3
+python examples/so101/build_focus_boxes.py --root $DATA --labels labels_task3 --det det_task3 --color color_task3 \
+    --out boxes_focus
 python examples/so101/qa_video.py $DATA boxes_focus qa_focus 0,51,108
 ```

@@ -19,12 +19,16 @@ whole episode and on 1 s windows, and did not localize the steps):
                   distance to the grasp pose (the last frame with d >= DEPART * the largest d of the 2 s before it,
                   ignoring pauses close to the cube). The home pose can be farther from the cube than the handle, so
                   the largest d of the whole episode is not a usable reference.
-Objects are static while they are a focus, so each one is the median of its LocateAnything detections (detect_objects.py)
-in the frames where it is not occluded. The drawer handle, the drawer front and the place inside the drawer are not
+The red and the blue cube are located by colour (color_track.py, --color): more precise than a detector, and it sees
+the cube inside the translucent drawer. (Following the cube while the drawer moves was tried: the cube is hidden
+during the motion itself, so there is nothing to follow, and the track then jumps to the arm's red wires.) Without a colour track, and for the pot and the orange cube, an object is the
+median of its LocateAnything detections (detect_objects.py) in the frames where it is not occluded. The drawer handle, the drawer front and the place inside the drawer are not
 detected reliably (three identical translucent drawers, and the Qwen3-VL gripper boxes often sit on the arm instead of
 the jaws): they are where the gripper tip is while the arm pulls / releases / pushes. The tip pixel comes from the arm
 joints through a quadratic ridge fit (TipModel) on the moments where the tip position is known: at the grasp it is on
-the red cube, at the release on the place target. Leave-one-out error of that fit: ~15 px median on 640x360.
+the red cube, at the release on the place target, and while the cube is carried it is where the cube's colour is.
+Error on held-out episodes: ~15 px median at grasp / release poses, ~23 px in transit (59 px without the carried
+cube), on 640x360.
 The same fit checks the detections: a cube / target detected more than OFF px from where the hand grasps / releases is
 replaced by the tip position (summary column from_tip).
 The window size does not depend on the detected box: one size per focus, the same in every episode. build_store.py
@@ -53,6 +57,10 @@ FOCUS = {"pot": {"pick": "pot", "place": "target", "retreat": "target"},
 # Following the tip frame by frame was tried and dropped: away from grasp / release poses the fit is off by ~30 px
 # median (>75 px for a quarter of the frames, checked against the carried cube), so the window wandered off the drawer.
 TIP = {"handle": ("pull", 0.6, 1.0), "front": ("push", 0.3, 0.8)}
+NEAR = 110  # px: a tip-located drawer focus farther than this from the cube lying in that drawer is a gross error
+# A colour cluster counts as the cube only when it has this fraction of the cube's usual size in the episode: the
+# arm's red servo wires and the blue sticker on the drawer unit are small clusters of the same colours.
+MIN_SIZE = 0.3
 COLUMN = {"handle": "drawer", "front": "drawer", "dest": "target"}  # role column the focus is stored under
 OFF = 75  # px: a detected focus farther than this from the gripper tip at the grasp / release is replaced by the tip
 # Window side as a multiple of --side: the pot is ~125 px wide, and the tip-located foci need room for the error of
@@ -96,13 +104,15 @@ def split_phases(task, state, t_grasp, t_release):
 class TipModel:
     """Arm joints (state[:5]) -> gripper-tip pixel in the top view, fitted on (joints, known tip position) pairs."""
 
-    def __init__(self, x, y, lam=0.1, drop=60):
+    def __init__(self, x, y, weight=None, lam=1.0, drop=60):
         x, y = np.asarray(x, float), np.asarray(y, float)
+        weight = np.ones(len(x)) if weight is None else np.asarray(weight, float)
         self.mu, self.sd = x.mean(0), x.std(0)
         keep = np.ones(len(x), bool)
-        for _ in range(2):  # second fit without the pairs the first one misses by > `drop` px (wrong detections)
+        for _ in range(3):  # refit without the pairs the previous fit misses by > `drop` px (wrong positions)
             f = self._feats(x[keep])
-            self.w = np.linalg.solve(f.T @ f + lam * np.eye(f.shape[1]), f.T @ y[keep])
+            fw = f * weight[keep, None]
+            self.w = np.linalg.solve(fw.T @ f + lam * np.eye(f.shape[1]), fw.T @ y[keep])
             self.err = np.linalg.norm(self(x) - y, axis=1)
             keep = self.err < drop
 
@@ -119,11 +129,18 @@ def center(b):
     return [(b[0] + b[2]) / 2 * W, (b[1] + b[3]) / 2 * H]
 
 
+def point(xy):
+    """A pixel position as a zero-size normalized box."""
+    u, v = np.clip(xy[0] / W, 0, 1), np.clip(xy[1] / H, 0, 1)
+    return np.array([u, v, u, v])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", required=True)
     ap.add_argument("--labels", required=True, help="labels_raw: the task of each episode")
     ap.add_argument("--det", required=True, help="detect_objects.py output")
+    ap.add_argument("--color", default=None, help="color_track.py output: locate the red and blue cubes by colour")
     ap.add_argument("--out", required=True)
     ap.add_argument("--side", type=float, default=100, help="window side in pixels of the 640x360 top view")
     ap.add_argument("--saccade", type=int, default=30, help="frames over which the window moves to the next target")
@@ -133,7 +150,7 @@ def main():
     df = pd.concat([pd.read_parquet(f, columns=["episode_index", "frame_index", "observation.state"])
                     for f in sorted(glob.glob(f"{a.root}/data/chunk-*/*.parquet"))])
     only = {int(x) for x in a.episodes.split(",")} if a.episodes else None
-    summary, eps, pairs = [], [], []
+    summary, eps, pairs, carried = [], [], [], []
     for p in sorted(glob.glob(f"{a.labels}/episode_*.json")):
         L = json.load(open(p))
         e, n, task = L["episode_index"], L["length"], L.get("task", "drawer")
@@ -159,24 +176,53 @@ def main():
                 obj["target"] = median_box(det, "target", 0, n)
             if obj["target"] is None and task == "stack":  # the red cube rests on the blue one after the release
                 obj["target"] = median_box(det, "cube", t_release + 15, t_release + 120)
+        col = None
+        if a.color and os.path.exists(f"{a.color}/episode_{e:03d}.parquet"):
+            # The colour track is more precise than the detections and also sees the cube inside the drawer.
+            col = pd.read_parquet(f"{a.color}/episode_{e:03d}.parquet")
+
+            def seen(c, lo, hi):
+                big = col[c + "n"] >= MIN_SIZE * np.nanpercentile(col[c + "n"], 90)
+                v = col[(col.f >= lo) & (col.f < hi) & big][[c + "x", c + "y"]].dropna().to_numpy()
+                return point(np.median(v, 0)) if len(v) >= 3 else None
+
+            red = seen("r", max(s, t_grasp - 150), t_grasp - 20)  # after the pull: the cube moves with the drawer
+            if red is not None and task != "pot":
+                obj["cube"] = red
+            elif red is not None and obj["pot"] is not None and obj["pot"][0] < red[0] < obj["pot"][2] \
+                    and obj["pot"][1] < red[1] < obj["pot"][3]:
+                obj["pot"] = red  # the cube inside the pot, when the camera sees it
+            blue = seen("b", 0, t_grasp)
+            # The drawer unit carries a blue sticker: trust the colour only next to the detected blue cube.
+            if task == "stack" and blue is not None and (obj["target"] is None or np.abs(
+                    np.subtract(center(blue), center(obj["target"]))).max() < 30):
+                obj["target"] = blue
+            if task == "drawer":
+                obj["dest"] = seen("r", t_release + 5, t_release + 45)  # the cube where it was dropped
+            if task != "pot":  # (the orange target of the pot task passes for red in shadow)
+                big = col.rn >= MIN_SIZE * np.nanpercentile(col.rn, 90)
+                c = col[(col.f >= t_grasp + 3) & (col.f < t_release - 3) & big].dropna(subset=["rx", "ry"])
+                carried += [(state[f, :5], (x, y)) for f, x, y in zip(c.f, c.rx, c.ry)]
         # Known tip positions: on the cube (in the pot for the pot task) at the grasp, on the target at the release.
         at_grasp = obj["pot"] if task == "pot" else obj["cube"]
         if at_grasp is not None:
             pairs.append((state[t_grasp:t_grasp + 5, :5].mean(0), center(at_grasp)))
         at_release = obj.get("target")
         if task == "drawer":  # the cube lies where it was dropped until the drawer is pushed
-            at_release = median_box(det, "cube", t_release + 15, t_release + 120)
+            at_release = obj.get("dest")
+            if at_release is None:
+                at_release = median_box(det, "cube", t_release + 15, t_release + 120)
         if at_release is not None and t_release < n - 1:
             pairs.append((state[max(t_release - 5, 0):t_release, :5].mean(0), center(at_release)))
-        eps.append(dict(e=e, n=n, task=task, state=state, ph=ph, s=s, t_grasp=t_grasp, t_release=t_release, obj=obj))
+        eps.append(dict(e=e, n=n, task=task, state=state, ph=ph, s=s, t_grasp=t_grasp, t_release=t_release, obj=obj,
+                        col=col))
 
-    tip = TipModel(*zip(*pairs))
-    print(f"tip fit: {len(pairs)} pairs, error median {np.median(tip.err):.1f} px, "
-          f"{(tip.err >= 60).sum()} pairs dropped", flush=True)
-
-    def point(xy):
-        u, v = np.clip(xy[0] / W, 0, 1), np.clip(xy[1] / H, 0, 1)
-        return np.array([u, v, u, v])
+    # The carried cube is the tip too, at thousands of poses in transit; the grasp / release pairs are fewer but
+    # exact, so they weigh more.
+    tip = TipModel(*zip(*(pairs + carried)), weight=[10.0] * len(pairs) + [1.0] * len(carried))
+    print(f"tip fit: {len(pairs)} grasp/release pairs (error median {np.median(tip.err[:len(pairs)]):.1f} px), "
+          f"{len(carried)} carried-cube pairs (median {np.median(tip.err[len(pairs):]) if carried else 0:.1f} px), "
+          f"{(tip.err >= 60).sum()} dropped", flush=True)
 
     for ep in eps:
         e, n, task, state, ph, obj = (ep[k] for k in ("e", "n", "task", "state", "ph", "obj"))
@@ -205,7 +251,12 @@ def main():
             idx = np.where(ph == phase)[0]
             part = idx[int(len(idx) * lo):max(int(len(idx) * hi), int(len(idx) * lo) + 1)]
             if k in need and len(part):
-                obj[k] = point(np.median(tip(state[part, :5]), 0))
+                xy = np.median(tip(state[part, :5]), 0)
+                anchor = obj.get("dest" if task == "drawer" else "cube")  # the cube lies in the drawer being moved
+                if anchor is not None and "dest" not in fixed and "cube" not in fixed:
+                    off = xy - center(anchor)
+                    xy = center(anchor) + off * min(1, NEAR / max(np.linalg.norm(off), 1e-6))
+                obj[k] = point(xy)
                 ctr[idx], side[idx] = center(obj[k]), a.side * SCALE.get(k, 1)
         # Saccades: from the boundary on, ease from where the window was to where the new subtask wants it.
         for i in np.where(names[1:] != names[:-1])[0] + 1:
@@ -233,7 +284,7 @@ def main():
                             **{k: round(float((ph == k).mean()), 3) for k in ALL_PHASES if k in FOCUS[task]},
                             split=ep["s"], grasp=int(ep["t_grasp"]), release=int(ep["t_release"]),
                             missing=",".join(sorted(k for k in need if obj.get(k) is None)),
-                            from_tip=",".join(sorted(set(fixed) - {"dest"}))))
+                            from_tip=",".join(sorted(fixed))))
     sm = pd.DataFrame(summary).sort_values("episode")
     sm.to_csv(f"{a.out}/summary.csv", index=False)
     print(sm.to_string())
