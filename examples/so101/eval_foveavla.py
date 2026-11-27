@@ -6,6 +6,10 @@ Queries every REPLAN frames. The crop at each query comes from one of two source
 Reports action-chunk MAE against the recorded absolute actions, and IoU of the predicted future box against the
 label at t+REPLAN where that label is valid.
 
+--episodes picks other episodes than the single-task held-out set, each prompted with its own task. With --steps the
+summary also holds the open-loop MSE/MAE of openpi's scripts/eval_so101_open_loop.py (the gr00t protocol: chunks tiled
+over the first --steps frames, one error per episode, mean over episodes), for comparison with the pi0.5 runs.
+
 Run from the repo root with PYTHONPATH=src:packages/foveavla-client/src:examples/so101 (see README.md).
 """
 import argparse, glob, json, os
@@ -57,16 +61,19 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default="foveavla_so101_single")
     ap.add_argument("--modes", default="self,gt")
+    ap.add_argument("--episodes", type=int, nargs="+", default=list(_config.SO101_HELDOUT_EPISODES))
+    ap.add_argument("--steps", type=int, default=None, help="also report the tiled open-loop MSE/MAE over this many frames")
+    ap.add_argument("--norm-std", type=float, default=None, help="absolute action std, for the normalized MAE")
     a = ap.parse_args()
     cfg = _config.get_config(a.config)
     policy = policy_config.create_trained_policy(cfg, a.checkpoint)
     info = json.load(open(f"{a.root}/meta/info.json"))["features"]["observation.images.top_depth"]["info"]
-    prompt = pd.read_parquet(f"{a.root}/meta/tasks.parquet").index[0]
+    prompts = pd.read_parquet(f"{a.root}/meta/tasks.parquet").sort_values("task_index").index.tolist()
     eps = pd.concat([pd.read_parquet(f) for f in sorted(glob.glob(f"{a.root}/meta/episodes/chunk-*/*.parquet"))])
-    df = pd.concat([pd.read_parquet(f, columns=["episode_index", "frame_index", "observation.state", "action"])
+    df = pd.concat([pd.read_parquet(f, columns=["episode_index", "frame_index", "task_index", "observation.state", "action"])
                     for f in sorted(glob.glob(f"{a.root}/data/chunk-*/*.parquet"))])
-    rows = []
-    for e in _config.SO101_HELDOUT_EPISODES:
+    rows, tiled = [], []
+    for e in a.episodes:
         r = eps[eps.episode_index == e].iloc[0]
         n = int(r["length"])
         vids = {}
@@ -77,11 +84,12 @@ def main():
         d = df[df.episode_index == e].sort_values("frame_index")
         state = np.stack(d["observation.state"].to_numpy()).astype(np.float32)
         action = np.stack(d["action"].to_numpy()).astype(np.float32)
+        prompt = prompts[int(d["task_index"].iloc[0])]
         B = pd.read_parquet(f"{a.boxes}/episode_{e:03d}.parquet")
         gt_box = B[["x1", "y1", "x2", "y2"]].to_numpy(np.float32)
         gt_valid = B["valid"].to_numpy()
         for mode in a.modes.split(","):
-            prev = None
+            prev, errs = None, []
             for t in range(0, n, REPLAN):
                 depth, dvalid = bs.dequantize(vids["top_depth"][t], info)
                 box = prev if mode == "self" else (gt_box[t] if gt_valid[t] else None)
@@ -89,6 +97,8 @@ def main():
                 chunk = np.asarray(out["actions"])
                 target = action[np.minimum(np.arange(t, t + len(chunk)), n - 1)]
                 err = np.abs(chunk - target)
+                if a.steps and t % len(chunk) == 0 and t < min(a.steps, n - len(chunk)):
+                    errs.append(chunk - target)
                 pb, pv = np.asarray(out["future_interaction_box"], np.float32), bool(out["future_interaction_box_valid"])
                 if pv:
                     prev = pb
@@ -96,15 +106,25 @@ def main():
                 rows.append(dict(mode=mode, episode=e, t=t, mae=float(err.mean()), mae_exec=float(err[:REPLAN].mean()),
                                  **{f"mae_j{j}": float(err[:, j].mean()) for j in range(6)}, box_valid=pv,
                                  iou=float(iou(pb, gt_box[f])) if (pv and f < n and gt_valid[f]) else np.nan))
+            if errs:
+                d_ = np.concatenate(errs)
+                tiled.append(dict(mode=mode, episode=e, mse=float((d_ ** 2).mean()), mae=float(np.abs(d_).mean()),
+                                  steps=len(d_)))
         print(f"episode {e} done", flush=True)
     R = pd.DataFrame(rows)
     os.makedirs(a.out, exist_ok=True)
     R.to_csv(f"{a.out}/queries.csv", index=False)
     summary = {m: {k: float(g[k].mean()) for k in ["mae", "mae_exec"] + [f"mae_j{j}" for j in range(6)] + ["box_valid", "iou"]}
                | {"queries": int(len(g))} for m, g in R.groupby("mode")}
-    json.dump({"checkpoint": a.checkpoint, "heldout": list(_config.SO101_HELDOUT_EPISODES), "replan": REPLAN,
-               "summary": summary}, open(f"{a.out}/summary.json", "w"), indent=1)
-    print(json.dumps(summary, indent=1))
+    result = {"checkpoint": a.checkpoint, "episodes": list(a.episodes), "replan": REPLAN, "summary": summary}
+    if tiled:
+        T = pd.DataFrame(tiled)
+        T.to_csv(f"{a.out}/open_loop.csv", index=False)
+        result["open_loop"] = {"steps": a.steps, "per_episode": tiled, "average": {
+            m: {"mse": float(g.mse.mean()), "mae": float(g.mae.mean())}
+            | ({"mae_normalized": float(g.mae.mean() / a.norm_std)} if a.norm_std else {}) for m, g in T.groupby("mode")}}
+    json.dump(result, open(f"{a.out}/summary.json", "w"), indent=1)
+    print(json.dumps(result, indent=1))
 
 
 if __name__ == "__main__":
