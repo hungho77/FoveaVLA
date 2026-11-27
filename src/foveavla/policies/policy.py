@@ -128,33 +128,64 @@ class PytorchPolicy(BasePolicy):
         self._metadata = foveation.with_legacy_fields(metadata or {})
         self._generator = torch.Generator(device=device).manual_seed(seed)
 
-    @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+    def _prepare_inference(self, obs: dict, noise: np.ndarray | None):
         torch = self._torch
         inputs = self._input_transform(jax.tree.map(lambda x: x, obs))
         inputs = jax.tree.map(lambda x: np.asarray(x)[np.newaxis, ...], inputs)
         observation = _model.Observation.from_dict(inputs)
         observation = jax.tree.map(lambda x: torch.from_numpy(np.asarray(x)).to(self._device), observation)
-        model = self._model
         if noise is None:
-            shape = (1, model.config.action_horizon, model.config.action_dim)
+            shape = (1, self._model.config.action_horizon, self._model.config.action_dim)
             noise = torch.randn(shape, generator=self._generator, device=self._device)
         else:
             noise = torch.from_numpy(np.asarray(noise, np.float32)).to(self._device)
             noise = noise[None] if noise.ndim == 2 else noise
-        started = time.monotonic()
-        with torch.no_grad():
-            prefix = model.prepare_inference_prefix(observation)
-            actions = model.sample_actions(observation, noise=noise, prefix=prefix, **self._sample_kwargs)
-            bbox, valid = model.sample_future_bbox(observation, prefix=prefix)
-        outputs = {
-            "state": inputs["state"][0],
-            "actions": actions[0].float().cpu().numpy(),
+        return inputs, observation, noise
+
+    def _action_outputs(self, inputs: dict, actions) -> dict:
+        return self._output_transform({"state": inputs["state"][0], "actions": actions[0].float().cpu().numpy()})
+
+    @staticmethod
+    def _bbox_outputs(bbox, valid) -> dict:
+        return {
             "future_interaction_box": bbox[0].float().cpu().numpy(),
             "future_interaction_box_valid": valid[0].cpu().numpy(),
         }
-        outputs = self._output_transform(outputs)
+
+    @override
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:
+        inputs, observation, noise = self._prepare_inference(obs, noise)
+        model = self._model
+        started = time.monotonic()
+        with self._torch.no_grad():
+            prefix = model.prepare_inference_prefix(observation)
+            actions = model.sample_actions(observation, noise=noise, prefix=prefix, **self._sample_kwargs)
+            bbox, valid = model.sample_future_bbox(observation, prefix=prefix)
+        outputs = self._output_transform(
+            {"state": inputs["state"][0], "actions": actions[0].float().cpu().numpy(), **self._bbox_outputs(bbox, valid)}
+        )
         outputs["policy_timing"] = {"infer_ms": (time.monotonic() - started) * 1000}
+        return foveation.with_legacy_fields(outputs)
+
+    def infer_actions_with_pending_bbox(self, obs: dict, *, noise: np.ndarray | None = None):
+        """Return actions first; decode the next interaction box while the robot executes them."""
+        inputs, observation, noise = self._prepare_inference(obs, noise)
+        started = time.monotonic()
+        # no_grad is per-thread, and the server runs each stage in its own worker thread.
+        with self._torch.no_grad():
+            prefix = self._model.prepare_inference_prefix(observation)
+            actions = self._model.sample_actions(observation, noise=noise, prefix=prefix, **self._sample_kwargs)
+        outputs = self._action_outputs(inputs, actions)
+        outputs["policy_timing"] = {"actions_infer_ms": (time.monotonic() - started) * 1000}
+        return outputs, PendingFutureBbox((observation, prefix))
+
+    def infer_future_bbox(self, pending: PendingFutureBbox) -> dict:
+        started = time.monotonic()
+        observation, prefix = pending.prefix
+        with self._torch.no_grad():
+            bbox, valid = self._model.sample_future_bbox(observation, prefix=prefix)
+        outputs = self._bbox_outputs(bbox, valid)
+        outputs["policy_timing"] = {"bbox_infer_ms": (time.monotonic() - started) * 1000}
         return foveation.with_legacy_fields(outputs)
 
     @property
