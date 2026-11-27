@@ -224,8 +224,9 @@ seven more numbers in the discrete state of the prompt (`foveavla.shared.spatial
 - **Hand position** (3): the point between the jaw tips in the robot base frame, in metres, by forward kinematics
   of the SO101 URDF chain.
 - **Gaze offset** (3): the shortest move that puts the hand on the line of sight through the centre of the foveal
-  crop, in the same frame. It is 10 cm one and a half seconds before a grasp and 1.7 cm at the grasp (0.5-3.4 cm
-  over 105 grasps; 3.2 cm at a release on the blue cube, 4.7 cm over the drawer, where the cube is dropped).
+  crop, in the same frame. Its length is 10 cm three seconds before a grasp, 4.8 cm two seconds before, 2.0 cm one
+  second before and 1.7 cm at the grasp (medians over 105 grasps; 0.5-3.4 cm at the grasp). At a release it is
+  3.2 cm on the blue cube and 4.7 cm over the drawer, where the cube is dropped from above.
 - **Has gaze** (1): 0 when the crop is the whole view.
 
 No model change and no new parameters; the state stays within the 32 padded dimensions and the prompt within its
