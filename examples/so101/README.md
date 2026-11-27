@@ -93,3 +93,70 @@ python /path/to/FoveaVLA/examples/so101/eval_pi05.py --config pi05_so101_drawer_
 ```
 
 The eval runs on 6 held-out episodes of one task. It measures action error, not task success.
+
+## Three tasks in one model
+
+`foveavla_so101_task3` trains one FoveaVLA-Single on the merged left-arm dataset `hungho77/so101-left-arm-task3`
+(LeRobot v3.0, 159 episodes, 133,763 frames, cameras `top`, `wrist` and `top_depth`). Each frame is prompted with its
+own task:
+
+| episodes | task | phases → interaction box |
+|---|---|---|
+| 0–50 | red cube out of the steel pot into the orange hollow cube | pick: gripper + pot (the cube is inside it) → place: gripper + cube + target → retreat: gripper + target |
+| 51–107 | the drawer/red-block task above (identical frames) | pull → pick → place → push, unchanged |
+| 108–158 | open the drawer, stack the red cube on the blue cube | pull: gripper + drawer → pick: gripper + cube → place: gripper + cube + target → retreat: gripper + target |
+
+`label_boxes.py` picks the objects to ask for from each episode's task string, and `build_boxes.py` picks the phases
+and roles from the task recorded in the label file. The drawer prompt and drawer boxes are unchanged, so the
+drawer labels can be copied over with episode index + 51 instead of labeling them again. The pot and target never
+move on their own, so each episode uses its median box for them. The recipe follows the π0.5 run on the same data
+(`pi05_so101_leftarm_task3` in hungho77/openpi): batch 128, 6,000 steps, cosine decay over the run, PyTorch float32
+on one 80GB GPU as 16 micro-batches of 8. It trains on every episode except 56 and 75, the two drawer episodes whose
+gripper never moves.
+
+Labeling needs `transformers>=4.57` (Qwen3-VL), which the openpi environment does not have. Use a separate venv with
+torch, transformers, av, pandas<3 and pyarrow<20 for it.
+
+```bash
+export DATA=/path/to/hungho77/so101-left-arm-task3
+export FOVEAVLA_SO101_TASK3_STORE=/path/to/foveavla_store_task3
+python examples/so101/label_boxes.py --root $DATA --out labels_task3 --episodes 0-50,108-158
+python examples/so101/build_boxes.py --root $DATA --labels labels_task3 --out boxes_task3
+python examples/so101/qa_final.py $DATA boxes_task3 qa_pot.jpg 0,17,34,50 8
+python examples/so101/build_store.py --root $DATA --boxes boxes_task3 --out $FOVEAVLA_SO101_TASK3_STORE \
+    --key-prefix so101_task3 --no-wrist
+python scripts/compute_norm_stats.py --config-name foveavla_so101_task3
+python scripts/train_pytorch.py foveavla_so101_task3 --exp-name task3_bs128_6k \
+    --pytorch-weight-path /path/to/pi05_base_pytorch --no-wandb-enabled
+```
+
+### Subtask-focused boxes
+
+The union boxes above jump in size (they stretch with the hand-to-object distance) and 15–19% of the frames have no box,
+mostly because a gripper label was dropped. `build_focus_boxes.py` builds the boxes differently: every subtask looks at
+one target with a fixed window (150 px; 188 px for the pot) that does not include the gripper, and the window moves to the next target at the
+subtask boundary over 12 frames.
+
+| task | subtask → focus |
+|---|---|
+| pot | pick → pot · place, retreat → orange hollow cube |
+| stack | pull → drawer handle · pick → red cube · place, retreat → blue cube |
+| drawer | pull → drawer handle · pick → red cube · place → where the cube ends up in the drawer · push → drawer front |
+
+Objects come from LocateAnything-3B (`detect_objects.py`, every 5th frame, median per episode); it boxes the cubes and
+the pot precisely but cannot box the gripper alone, and the Qwen3-VL gripper boxes often sit on the arm. The handle,
+the drawer front and the place inside the drawer are therefore where the gripper tip is while the arm pulls, pushes or
+releases: the tip pixel is a quadratic ridge fit from the five arm joints, trained on the moments where it is known (on
+the cube at the grasp, on the target at the release; ~13 px median error). The same fit replaces a detection that is
+more than 75 px from where the hand grasps or releases. Subtask boundaries come from the robot state: grasp and release
+from the gripper, pull → pick from the closed-jaw segment (stack) or from the arm leaving for the grasp pose (drawer).
+On the 155 episodes with a grasp, every frame has a box, every window has the same size, and no box jumps within a
+subtask. The Qwen3-VL label files are only read for the task of each episode. The output has the format of
+`build_boxes.py`.
+
+```bash
+python examples/so101/detect_objects.py --root $DATA --tasks labels_task3 --out det_task3 \
+    --eagle /path/to/Eagle/Embodied --model /path/to/LocateAnything-3B        # needs transformers 4.57, peft, decord
+python examples/so101/build_focus_boxes.py --root $DATA --labels labels_task3 --det det_task3 --out boxes_focus
+python examples/so101/qa_video.py $DATA boxes_focus qa_focus 0,51,108
+```

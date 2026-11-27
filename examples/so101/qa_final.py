@@ -1,5 +1,5 @@
 """QA sheet of the built interaction boxes: per frame the role boxes (gripper yellow, cube red, drawer green), the
-interaction box (white, phase in the caption) and, next to it, the exact foveal crop the model would get."""
+interaction box (white, phase in the caption; pot cyan, target cube blue for the 3-task set) and, next to it, the exact foveal crop the model would get."""
 import sys, glob
 import numpy as np, pandas as pd
 from PIL import Image, ImageDraw
@@ -25,7 +25,9 @@ for e in episodes:
         b = B.iloc[i]
         small = im.resize((320, 180))
         d = ImageDraw.Draw(small)
-        for r, c in (("gripper", "yellow"), ("cube", "red"), ("drawer", "lime")):
+        for r, c in (("gripper", "yellow"), ("cube", "red"), ("drawer", "lime"), ("pot", "cyan"), ("target", "blue")):
+            if f"{r}_x1" not in b:
+                continue
             rb = b[[f"{r}_x1", f"{r}_y1", f"{r}_x2", f"{r}_y2"]].to_numpy(float)
             if np.isfinite(rb).all():
                 d.rectangle([rb[0] * 320, rb[1] * 180, rb[2] * 320, rb[3] * 180], outline=c, width=1)

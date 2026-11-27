@@ -1,13 +1,14 @@
-"""Build the FoveaVLA training store for the SO101 drawer/red-block dataset.
+"""Build the FoveaVLA training store for an SO101 left-arm dataset (drawer/red-block, or the merged 3-task set).
 
 For every frame t of every episode it writes, at 224x224:
   full   - top RGB letterboxed (base_0_rgb)
   crop   - foveal crop of the top RGB around the interaction box at t (left_wrist_0_rgb slot), with the paper's crop
            sampling: 10% full image, 45% jittered, 45% exact, context scale 1.5, seeded per sample
-  wrist  - wrist RGB letterboxed (only for the pi0.5 top+wrist baseline)
+  wrist  - wrist RGB letterboxed (only for the pi0.5 top+wrist baseline; skipped with --no-wrist)
   depth  - metric depth (m) for the full view and the crop, nearest-sampled on the same grids, f16 [2,224,224]
   qual   - depth validity for both views, u8 [2,224,224]
-plus meta.parquet: episode/frame index, state, crop mode/bbox, future box (t+OFFSET) and its mask.
+plus meta.parquet: episode/frame/task index, state, crop mode/bbox, future box (t+OFFSET) and its mask, and
+store.json with the task strings ("prompts", indexed by task_index; "prompt" is the first, for single-task readers).
 Crop rendering and depth sampling reuse the official droid_foveation / foveavla functions unchanged.
 
 Run from the repo root with PYTHONPATH=src:packages/foveavla-client/src:examples/so101 (see README.md).
@@ -58,10 +59,12 @@ def decode(path, t0, n, fmt):
 
 
 def process(job):
-    root, row, offset0, boxes_path, out_dir, info = job
+    root, row, offset0, boxes_path, out_dir, info, key_prefix, wrist = job
     e, n = int(row["episode_index"]), int(row["length"])
     vids = {}
     for cam, fmt in (("top", "rgb24"), ("wrist", "rgb24"), ("top_depth", "gray12le")):
+        if cam == "wrist" and not wrist:
+            continue
         k = f"videos/observation.images.{cam}"
         p = f"{root}/{k}/chunk-{int(row[k + '/chunk_index']):03d}/file-{int(row[k + '/file_index']):03d}.mp4"
         vids[cam], miss = decode(p, float(row[k + "/from_timestamp"]), n, fmt)
@@ -70,19 +73,21 @@ def process(job):
     B = pd.read_parquet(boxes_path) if os.path.exists(boxes_path) else None
     box = B[["x1", "y1", "x2", "y2"]].to_numpy(np.float32) if B is not None else np.full((n, 4), np.nan, np.float32)
     valid = B["valid"].to_numpy() if B is not None else np.zeros(n, bool)
-    mm = {k: np.load(f"{out_dir}/{k}.npy", mmap_mode="r+") for k in ("full", "crop", "wrist", "depth", "qual")}
+    views = ("full", "crop", "depth", "qual") + ("wrist",) * wrist
+    mm = {k: np.load(f"{out_dir}/{k}.npy", mmap_mode="r+") for k in views}
     meta = []
     for t in range(n):
         g = offset0 + t
         img = vids["top"][t]
-        key = f"so101_drawer--{e}--{t}"
+        key = f"{key_prefix}--{e}--{t}"
         if valid[t]:
             mode, cb = rd.choose_crop(img.shape, box[t], key, CROP_ARGS)
         else:
             mode, cb = rd.CROP_MODE_FULL, (0, 0, img.shape[1], img.shape[0])
         mm["full"][g] = rd.resize_with_pad(img, OUT)
         mm["crop"][g] = rd.resize_with_pad(img, OUT) if mode == rd.CROP_MODE_FULL else rd.render_square_crop(img, cb, OUT)
-        mm["wrist"][g] = rd.resize_with_pad(vids["wrist"][t], OUT)
+        if wrist:
+            mm["wrist"][g] = rd.resize_with_pad(vids["wrist"][t], OUT)
         depth, dvalid = dequantize(vids["top_depth"][t], info)
         fd, fv = _sample_aligned_depth(depth, dvalid, OUT, crop_bbox=None)
         cd, cv = (fd, fv) if mode == rd.CROP_MODE_FULL else _sample_aligned_depth(depth, dvalid, OUT, crop_bbox=cb)
@@ -104,6 +109,9 @@ def main():
     ap.add_argument("--boxes", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=6)
+    # Seeds the per-sample crop sampling; the drawer/red-block store used "so101_drawer".
+    ap.add_argument("--key-prefix", default="so101_drawer")
+    ap.add_argument("--no-wrist", action="store_true", help="skip the wrist view (FoveaVLA does not read it)")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     info = json.load(open(f"{a.root}/meta/info.json"))["features"]["observation.images.top_depth"]["info"]
@@ -113,10 +121,13 @@ def main():
     shapes = {"full": ((N, OUT, OUT, 3), np.uint8), "crop": ((N, OUT, OUT, 3), np.uint8),
               "wrist": ((N, OUT, OUT, 3), np.uint8), "depth": ((N, 2, OUT, OUT), np.float16),
               "qual": ((N, 2, OUT, OUT), np.uint8)}
+    if a.no_wrist:
+        del shapes["wrist"]
     for k, (shape, dt) in shapes.items():
         np.lib.format.open_memmap(f"{a.out}/{k}.npy", mode="w+", dtype=dt, shape=shape).flush()
     offsets = np.concatenate([[0], eps["length"].cumsum().to_numpy()[:-1]])
-    jobs = [(a.root, r, int(o), f"{a.boxes}/episode_{int(r['episode_index']):03d}.parquet", a.out, info)
+    jobs = [(a.root, r, int(o), f"{a.boxes}/episode_{int(r['episode_index']):03d}.parquet", a.out, info, a.key_prefix,
+             not a.no_wrist)
             for (_, r), o in zip(eps.iterrows(), offsets)]
     metas = []
     with ProcessPoolExecutor(a.workers) as ex:
@@ -125,15 +136,19 @@ def main():
             print(f"episode {int(m.episode_index.iloc[0])}: {len(m)} frames, box valid {m.box_valid.mean():.2f}, "
                   f"future mask {m.future_mask.mean():.2f}", flush=True)
     meta = pd.concat(metas).sort_values("index").reset_index(drop=True)
-    df = pd.concat([pd.read_parquet(f, columns=["episode_index", "frame_index", "index", "observation.state", "action"])
+    df = pd.concat([pd.read_parquet(f, columns=["episode_index", "frame_index", "index", "task_index",
+                                                "observation.state", "action"])
                     for f in sorted(glob.glob(f"{a.root}/data/chunk-*/*.parquet"))]).sort_values("index")
     assert (df["index"].to_numpy() == meta["index"].to_numpy()).all(), "store index != dataset index"
     meta["state"] = df["observation.state"].to_numpy()
     meta["action"] = df["action"].to_numpy()
+    meta["task_index"] = df["task_index"].to_numpy()
     meta.to_parquet(f"{a.out}/meta.parquet")
-    task = pd.read_parquet(f"{a.root}/meta/tasks.parquet").index[0]
-    json.dump({"frames": N, "episodes": len(eps), "offset": OFFSET, "prompt": task, "crop_args": vars(CROP_ARGS)},
-              open(f"{a.out}/store.json", "w"), indent=1)
+    tasks = pd.read_parquet(f"{a.root}/meta/tasks.parquet")
+    prompts = tasks.sort_values("task_index").index.tolist()
+    assert sorted(tasks["task_index"]) == list(range(len(tasks))), "task_index must be 0..T-1"
+    json.dump({"frames": N, "episodes": len(eps), "offset": OFFSET, "prompt": prompts[0], "prompts": prompts,
+               "key_prefix": a.key_prefix, "crop_args": vars(CROP_ARGS)}, open(f"{a.out}/store.json", "w"), indent=1)
     print("done", N)
 
 
