@@ -102,6 +102,7 @@ def create_rlds_dataset(
             action_horizon=action_horizon,
             episodes=data_config.so101_train_episodes or None,
             motion_lag=data_config.so101_motion_lag,
+            gaze_dropout=data_config.so101_gaze_dropout,
             shuffle=shuffle,
             repeat=repeat,
             seed=seed,

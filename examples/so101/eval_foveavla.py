@@ -12,6 +12,8 @@ over the first --steps frames, one error per episode, mean over episodes), for c
 
 A model with a motion stream gets the motion image of the full view against the frame --motion-lag steps earlier (a
 still image at the start of the episode); --motion off hides the stream from the model instead.
+A model with the spatial state gets the region of the full view its crop shows (none at the first self query), from
+which the policy computes the gaze offset; --gaze off hides the gaze from the model instead.
 
 Run from the repo root with PYTHONPATH=src:packages/foveavla-client/src:examples/so101 (see README.md).
 """
@@ -35,7 +37,7 @@ def iou(a, b):
     return inter / union if union > 0 else 0.0
 
 
-def obs_for(img, depth, dvalid, state, prompt, box, earlier=None, motion_on=True):
+def obs_for(img, depth, dvalid, state, prompt, box, earlier=None, motion_on=True, gaze_on=True):
     if box is None:
         mode, cb = rd.CROP_MODE_FULL, (0, 0, img.shape[1], img.shape[0])
     else:
@@ -44,9 +46,11 @@ def obs_for(img, depth, dvalid, state, prompt, box, earlier=None, motion_on=True
     crop = full if mode == rd.CROP_MODE_FULL else rd.render_square_crop(img, cb, bs.OUT)
     fd, fv = _sample_aligned_depth(depth, dvalid, bs.OUT, crop_bbox=None)
     cd, cv = (fd, fv) if mode == rd.CROP_MODE_FULL else _sample_aligned_depth(depth, dvalid, bs.OUT, crop_bbox=cb)
-    extra = {}
+    region = np.asarray(cb, np.float32) / np.tile(np.asarray(img.shape[1::-1], np.float32), 2)
+    extra = {"observation/foveal_region": np.full(4, np.nan, np.float32) if mode == rd.CROP_MODE_FULL else region,
+             "observation/gaze_mask": gaze_on}
     if earlier is not None:
-        extra = {"observation/motion_image": _motion.motion_image(full, rd.resize_with_pad(earlier, bs.OUT)),
+        extra |= {"observation/motion_image": _motion.motion_image(full, rd.resize_with_pad(earlier, bs.OUT)),
                  "observation/motion_image_mask": motion_on}
     return extra | {
         "observation/exterior_image_1_left": full,
@@ -74,6 +78,7 @@ def main():
     ap.add_argument("--norm-std", type=float, default=None, help="absolute action std, for the normalized MAE")
     ap.add_argument("--motion-lag", type=int, default=REPLAN, help="frame lag of the motion image (motion models)")
     ap.add_argument("--motion", choices=("on", "off"), default="on", help="off: hide the motion stream from the model")
+    ap.add_argument("--gaze", choices=("on", "off"), default="on", help="off: hide the gaze (spatial models)")
     a = ap.parse_args()
     cfg = _config.get_config(a.config)
     policy = policy_config.create_trained_policy(cfg, a.checkpoint)
@@ -106,7 +111,7 @@ def main():
                 box = prev if mode == "self" else (gt_box[t] if gt_valid[t] else None)
                 earlier = vids["top"][max(t - a.motion_lag, 0)] if has_motion else None
                 out = policy.infer(obs_for(vids["top"][t], depth, dvalid, state[t], prompt, box, earlier,
-                                           a.motion == "on"))
+                                           a.motion == "on", a.gaze == "on"))
                 chunk = np.asarray(out["actions"])
                 target = action[np.minimum(np.arange(t, t + len(chunk)), n - 1)]
                 err = np.abs(chunk - target)
@@ -133,6 +138,8 @@ def main():
     result = {"checkpoint": a.checkpoint, "episodes": list(a.episodes), "replan": REPLAN, "summary": summary}
     if has_motion:
         result["motion"] = {"lag": a.motion_lag, "stream": a.motion}
+    if getattr(cfg.data, "spatial_calibration", None) is not None:
+        result["gaze"] = a.gaze
     if tiled:
         T = pd.DataFrame(tiled)
         T.to_csv(f"{a.out}/open_loop.csv", index=False)

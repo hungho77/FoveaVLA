@@ -80,6 +80,8 @@ class DataConfig:
     so101_train_episodes: tuple[int, ...] = ()
     # Range of the frame lag of the motion image; None when the model has no motion stream.
     so101_motion_lag: tuple[int, int] | None = None
+    # Share of the training samples whose gaze is hidden; None when the state has no spatial part.
+    so101_gaze_dropout: float | None = None
 
 
 class GroupFactory(Protocol):
@@ -258,6 +260,11 @@ class SO101FovealDataConfig(DataConfigFactory):
     train_episodes: tuple[int, ...] = ()
     # Training draws the frame lag of the motion image from this range (used when the model has a motion stream).
     motion_lag: tuple[int, int] = (4, 16)
+    # Arm-and-camera calibration (examples/so101/calibrate_camera.py). When set, the state gains the spatial part of
+    # foveavla.shared.spatial: hand position, gaze offset, and whether there is a gaze.
+    spatial_calibration: str | None = None
+    # Training hides the gaze for this share of the samples (on top of those whose crop is the full view).
+    gaze_dropout: float = 0.15
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
@@ -281,15 +288,16 @@ class SO101FovealDataConfig(DataConfigFactory):
         keys += [f"observation/{f}_{s}" for s in ("full", "crop") for f in ("metric_depth", "pointmap_quality")]
         if has_motion:
             keys.append("observation/motion_image")
+        inputs = so101_policy.SO101MotionInputs() if has_motion else droid_policy.DroidInputs()
+        outputs = so101_policy.SO101Outputs()
+        if self.spatial_calibration is not None:
+            keys.append("observation/foveal_region")
+            memory = so101_policy.BoxMemory()
+            inputs = so101_policy.SO101SpatialInputs(inputs, self.spatial_calibration, memory)
+            outputs = so101_policy.SO101Outputs(memory)
         data_transforms = _transforms.Group(
-            inputs=[
-                so101_policy.SO101MotionInputs() if has_motion else droid_policy.DroidInputs(),
-                _transforms.DeltaActions(_transforms.make_bool_mask(5, -1)),
-            ],
-            outputs=[
-                _transforms.AbsoluteActions(_transforms.make_bool_mask(5, -1)),
-                so101_policy.SO101Outputs(),
-            ],
+            inputs=[inputs, _transforms.DeltaActions(_transforms.make_bool_mask(5, -1))],
+            outputs=[_transforms.AbsoluteActions(_transforms.make_bool_mask(5, -1)), outputs],
         )
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
@@ -299,6 +307,7 @@ class SO101FovealDataConfig(DataConfigFactory):
             so101_store_dir=self.store_dir,
             so101_train_episodes=self.train_episodes,
             so101_motion_lag=self.motion_lag if has_motion else None,
+            so101_gaze_dropout=self.gaze_dropout if self.spatial_calibration is not None else None,
         )
 
 
@@ -643,6 +652,18 @@ _so101_task2_motion_config = dataclasses.replace(
     },
 )
 
+# foveavla_so101_task2 plus the spatial state: seven more numbers in the discrete state of the prompt - the hand
+# position in the robot frame (forward kinematics), the gaze offset (the shortest move that puts the hand on the line
+# of sight through the centre of the foveal crop), and a flag for "no gaze". No model change, no new parameters; the
+# norm stats differ (13 state dimensions), so they are computed for this config.
+_so101_task2_spatial_config = dataclasses.replace(
+    _so101_task2_config,
+    name="foveavla_so101_task2_spatial",
+    data=dataclasses.replace(_so101_task2_config.data, spatial_calibration=str(so101_policy.LEFTARM_CALIBRATION)),
+    policy_metadata=_so101_task2_config.policy_metadata
+    | {"model_name": "FoveaVLA-Single-SO101-Task2-Spatial", "spatial_state": "hand_xyz+gaze_offset_xyz+has_gaze_v1"},
+)
+
 _CONFIGS_DICT = {
     config.name: config
     for config in (
@@ -654,6 +675,7 @@ _CONFIGS_DICT = {
         _so101_task3_config,
         _so101_task2_config,
         _so101_task2_motion_config,
+        _so101_task2_spatial_config,
     )
 }
 CONFIG_NAMES = tuple(_CONFIGS_DICT)

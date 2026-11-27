@@ -25,6 +25,7 @@ All four start from `pi05_base` and train at batch 32 for 20k steps. They hold o
 | `build_boxes.py` | cleans the tracks, derives the phases (pull, pick, place, push) from the gripper joint, writes the per-frame interaction box |
 | `qa_final.py` | contact sheet of the interaction boxes and the foveal crops they give |
 | `build_store.py` | 224×224 store: letterboxed top, foveal crop, wrist, metric depth and its validity, plus `meta.parquet` |
+| `calibrate_camera.py` | arm-to-camera calibration from the recorded episodes, for the spatial state (below) |
 | `eval_foveavla.py` | open-loop eval of C/C' on the held-out episodes, with crops from the model's own boxes (`self`) or the labels (`gt`) |
 | `eval_pi05.py` | the same eval for A/B |
 | `check_pt_policy.py` | JAX vs PyTorch policy on one frame with the same noise |
@@ -212,4 +213,46 @@ colour-blind, sensitive to change.
 python scripts/train_pytorch.py foveavla_so101_task2_motion --exp-name task2_motion_bs128_6k \
     --pytorch-weight-path /path/to/pi05_base_pytorch --no-wandb-enabled
 python examples/so101/eval_foveavla.py ... --config foveavla_so101_task2_motion [--motion off] [--motion-lag 8]
+```
+
+### Spatial state
+
+The arm knows where its hand is without looking at it; the model so far gets six joint angles and has to learn the
+kinematics and the camera geometry from 95 episodes. `foveavla_so101_task2_spatial` gives it the result directly, as
+seven more numbers in the discrete state of the prompt (`foveavla.shared.spatial`):
+
+- **Hand position** (3): the point between the jaw tips in the robot base frame, in metres, by forward kinematics
+  of the SO101 URDF chain.
+- **Gaze offset** (3): the shortest move that puts the hand on the line of sight through the centre of the foveal
+  crop, in the same frame. It is 10 cm one and a half seconds before a grasp and 1.7 cm at the grasp (0.5-3.4 cm
+  over 105 grasps; 3.2 cm at a release on the blue cube, 4.7 cm over the drawer, where the cube is dropped).
+- **Has gaze** (1): 0 when the crop is the whole view.
+
+No model change and no new parameters; the state stays within the 32 padded dimensions and the prompt within its
+200 tokens (98 used). The norm stats are computed for this config (13 state dimensions).
+
+- **Calibration** (`calibrate_camera.py`, result in `src/foveavla/policies/so101_leftarm_calibration.json`): no
+  target, only the episodes. The table plane in the depth background fixes the camera's roll, pitch and height; the
+  pixels of the carried cube and 3D anchors at the grasps and releases fix the rest (base pose on the table, joint
+  zero offsets, tool point, focal length). On the held-out episodes the tool point lands 13 px (median, 640x360)
+  from the carried cube and 2.9 cm from the anchors. Redo it when the camera or the arm base moves.
+- **No depth in the gaze offset**: placing the gaze point in 3D with the depth under the box was tried and was more
+  than 15 cm off in a tenth of the frames (the arm in front of the target, depth through the translucent drawers,
+  depth and colour images a few pixels apart on near objects). The offset therefore says how far the hand is from
+  the line of sight, not where on that line the target is; the depth streams carry that.
+- **Training**: the dataset passes the region of the full view that each stored crop shows
+  (`observation/foveal_region`); jittered crops are off the labelled box as a mispredicted box would be. The gaze
+  is hidden where the crop is the whole view (12%) and in a further 15% of the samples.
+- **Inference**: `SO101SpatialInputs` needs the joints and the region the client's crop shows. A client that crops
+  with `image_tools.extract_foveal_crop_direct` around the last valid box the policy returned needs no change: the
+  policy remembers that box (`BoxMemory`; forgotten after 3 s without a query or on `"reset": True`). A client can
+  send `observation/foveal_region` instead; `observation/gaze_mask: False` hides the gaze.
+
+```bash
+python examples/so101/calibrate_camera.py --store $FOVEAVLA_SO101_TASK2_STORE --color color --boxes boxes_focus \
+    --out src/foveavla/policies/so101_leftarm_calibration.json --heldout 66 68 80 86 96 132 139 146 152 158
+python scripts/compute_norm_stats.py --config-name foveavla_so101_task2_spatial
+python scripts/train_pytorch.py foveavla_so101_task2_spatial --exp-name task2_spatial_bs128_6k \
+    --pytorch-weight-path /path/to/pi05_base_pytorch --no-wandb-enabled
+python examples/so101/eval_foveavla.py ... --config foveavla_so101_task2_spatial [--gaze off]
 ```

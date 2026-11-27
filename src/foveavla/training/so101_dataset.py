@@ -8,6 +8,11 @@ per frame and the task strings in store.json "prompts"; single-task stores use s
 With `motion_lag=(lo, hi)` each sample also carries the motion image of its full view (foveavla.shared.motion) against
 the frame `lag` steps earlier in the same episode, `lag` drawn uniformly from lo..hi per sample (the first frame of the
 episode when the sample is closer to the start than that).
+
+With `gaze_dropout` set (a probability) each sample carries `observation/foveal_region`, the part of the full view its
+foveal crop shows (xyxy, normalized), for the spatial state (foveavla.shared.spatial). The region is NaN - no gaze -
+where the crop is the full view, as at the first query of an episode on the robot, and for a further `gaze_dropout`
+share of the samples, so the policy also works without it.
 """
 
 from collections.abc import Iterator, Sequence
@@ -18,6 +23,8 @@ import numpy as np
 import pandas as pd
 
 from foveavla.shared import motion
+
+_CROP_MODE_FULL = 1  # droid_foveation.repack_direct.CROP_MODE_FULL: the "crop" is the whole view
 
 
 class SO101FovealBatchDataset:
@@ -33,6 +40,7 @@ class SO101FovealBatchDataset:
         seed: int = 0,
         with_wrist: bool = False,
         motion_lag: tuple[int, int] | None = None,
+        gaze_dropout: float | None = None,
     ):
         root = pathlib.Path(store_dir)
         self._arrays = {k: np.load(root / f"{k}.npy", mmap_mode="r") for k in ("full", "crop", "depth", "qual")}
@@ -54,6 +62,14 @@ class SO101FovealBatchDataset:
         last = pd.Series(np.arange(len(meta))).groupby(episode).transform("max").to_numpy()
         self._first = pd.Series(np.arange(len(meta))).groupby(episode).transform("min").to_numpy()
         self._motion_lag = motion_lag
+        self._gaze_dropout = gaze_dropout
+        if gaze_dropout is not None:
+            region = np.stack(meta["crop_bbox"].to_numpy()).astype(np.float32)  # source pixels
+            full = meta["crop_mode"].to_numpy() == _CROP_MODE_FULL
+            # Stores built before "image_size" was recorded: the full-view crops span the whole image.
+            width, height = store.get("image_size") or region[full, 2:].max(0)
+            self._region = region / np.array([width, height, width, height], np.float32)
+            self._region[full] = np.nan
         self._chunk = np.minimum(np.arange(len(meta))[:, None] + np.arange(action_horizon)[None], last[:, None])
         keep = np.ones(len(meta), bool) if episodes is None else np.isin(episode, np.asarray(episodes))
         self._indices = np.flatnonzero(keep)
@@ -96,4 +112,8 @@ class SO101FovealBatchDataset:
             lag = self._rng.integers(self._motion_lag[0], self._motion_lag[1] + 1, len(idx))
             earlier = np.maximum(idx - lag, self._first[idx])
             batch["observation/motion_image"] = motion.motion_image(a["full"], self._arrays["full"][earlier])
+        if self._gaze_dropout is not None:
+            region = self._region[idx].copy()
+            region[self._rng.random(len(idx)) < self._gaze_dropout] = np.nan
+            batch["observation/foveal_region"] = region
         return batch

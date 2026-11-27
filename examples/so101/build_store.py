@@ -147,8 +147,9 @@ def main():
     tasks = pd.read_parquet(f"{a.root}/meta/tasks.parquet")
     prompts = tasks.sort_values("task_index").index.tolist()
     assert sorted(tasks["task_index"]) == list(range(len(tasks))), "task_index must be 0..T-1"
+    top = json.load(open(f"{a.root}/meta/info.json"))["features"]["observation.images.top"]["shape"]
     json.dump({"frames": N, "episodes": len(eps), "offset": OFFSET, "prompt": prompts[0], "prompts": prompts,
-               "key_prefix": a.key_prefix, "crop_args": vars(CROP_ARGS)}, open(f"{a.out}/store.json", "w"), indent=1)
+               "key_prefix": a.key_prefix, "crop_args": vars(CROP_ARGS), "image_size": [top[1], top[0]]}, open(f"{a.out}/store.json", "w"), indent=1)
     print("done", N)
 
 
